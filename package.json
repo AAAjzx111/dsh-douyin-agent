@@ -1,8 +1,8 @@
 {
   "name": "dsh-douyin-agent",
-  "version": "1.4.7",
+  "version": "1.4.8",
   "type": "module",
-  "description": "DSH 原生抖音工具：有限自主观看、抽帧故事板与弹幕、人格与兴趣记忆、自动问候与私信回复、观看日报",
+  "description": "DSH 原生抖音工具：有限自主观看、抽帧故事板与弹幕、人格与兴趣记忆、自动问候与私信回复、观看日报（改编自 dafeiyu1314520/dsh-douyin-agent 1.4.7）",
   "license": "MIT",
   "author": {
     "name": "dafeiyu1314520",
@@ -14,13 +14,18 @@
       "url": "https://github.com/LockyBee"
     }
   ],
+  "dshFork": {
+    "of": "dsh-douyin-agent@1.4.7",
+    "upstream": "https://github.com/dafeiyu1314520/dsh-douyin-agent",
+    "note": "个人使用中修复私信回复与自动问候两条链路的可靠性问题，署名与 MIT 许可归原作者及其上游作者。"
+  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dafeiyu1314520/dsh-douyin-agent.git"
+    "url": "git+https://github.com/AAAjzx111/dsh-douyin-agent.git"
   },
-  "homepage": "https://github.com/dafeiyu1314520/dsh-douyin-agent#readme",
+  "homepage": "https://github.com/AAAjzx111/dsh-douyin-agent#readme",
   "bugs": {
-    "url": "https://github.com/dafeiyu1314520/dsh-douyin-agent/issues"
+    "url": "https://github.com/AAAjzx111/dsh-douyin-agent/issues"
   },
   "keywords": [
     "dsh-plugin",
