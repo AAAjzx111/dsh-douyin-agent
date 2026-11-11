@@ -3,7 +3,9 @@
 本文件只记录本改编仓库相对上游 1.4.7 的改动。上游历史见
 [dafeiyu1314520/dsh-douyin-agent](https://github.com/dafeiyu1314520/dsh-douyin-agent) 的提交记录。
 
-## 未发布（基于 1.4.7）
+## 1.4.9（基于 1.4.7）
+
+发布为 npm 包 `dsh-douyin-agent-plus`。因为上游的 npm 包名 `dsh-douyin-agent` 归原作者所有，这个版本换了自己的包名；`cordis.bundle.yml` 里的 `name:` 也同步改成新包名（DSH 用这个字段找模块，名字不一致会表现为「装上了但设置页打不开」）。两者注册同一个 bundle id `douyin-browser`，同一个 profile 里只能装一个。
 
 所有改动都集中在「私信自动回复」与「自动问候（续火花）」两条链路，观看、人格、兴趣、日报部分未改。
 

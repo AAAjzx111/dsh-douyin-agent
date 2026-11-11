@@ -64,13 +64,21 @@
 
 ## 快速开始（插件版）
 
-### npm 安装（1.4.0 发布后可用）
+### npm 安装
 
 在 DSH Desktop 自带终端中运行：
 
 ```powershell
-dsh plugin --profile desktop add dsh-douyin-browser-local@1.4.0
+dsh plugin --profile desktop add dsh-douyin-agent-plus@1.4.9
 ```
+
+或直接从本仓库安装（不经过 npm）：
+
+```powershell
+dsh plugin --profile desktop add github:AAAjzx111/dsh-douyin-agent#v1.4.9
+```
+
+> 两种形式装的是同一份代码，包名与上游 `dsh-douyin-agent` 互斥：两套插件注册同一个 bundle id（`douyin-browser`），同一个 profile 里只能装一个。装这个之前先把原作卸掉，否则启动时会争同一个入口。
 
 需要 Windows、已安装 Microsoft Edge 和 DSH 0.2.0-rc.2，以及一个独立的 **Node.js 22.13 或更高版本**（插件要用它单独起浏览器进程；装了 Node LTS 就行，没装的话点「开始自主观看」会提示下载地址，也可以用 `DOUYIN_NODE_EXECUTABLE` 指定已有的 node.exe）。安装后按宿主提示重新加载，在设置中打开“刷抖音”；抖音登录和验证由使用者自行完成。市场收录与 npm 包发布分别同步，不能把发布成功当成市场已刷新。
 
