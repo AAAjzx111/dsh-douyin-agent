@@ -9,7 +9,9 @@ import { OutboundCoordinator } from './outbound-send.mjs';
 import { SparkAgent } from './spark-agent.mjs?v=9';
 import { loadApiConfig, redact } from './api-agent.mjs';
 
-const defaults = () => ({ version: 1, enabled: false, timeZone: 'Asia/Shanghai', windows: ['09:00-22:00'], dailyLimit: 2 });
+// 2026-11-07 主人定：DSH 一启动就自动接着问候。autoStart 记「主人希望它开着」，
+// 启动成功置真、手动停止置假；进程退出不改，所以下次启动会自动恢复。
+const defaults = () => ({ version: 1, enabled: false, autoStart: false, timeZone: 'Asia/Shanghai', windows: ['09:00-22:00'], dailyLimit: 2 });
 const emptyLedger = () => ({ version: 1, operations: [], contacts: {}, lastError: '' });
 const states = new Set(['reserved', 'sending', 'confirmed', 'uncertain', 'not-sent']);
 const recipientPattern = /^conv:[a-f0-9]{64}$/;
@@ -31,7 +33,8 @@ function write(file, value) {
 function validatePolicy(value) {
   if (!value || value.version !== 1 || typeof value.enabled !== 'boolean' || value.timeZone !== 'Asia/Shanghai' || !Number.isSafeInteger(value.dailyLimit) || value.dailyLimit < 1 || value.dailyLimit > 10) throw fail('续火花许可或每日次数须在 1 至 10 之间，未启用发送。', 'SPARK_POLICY_INVALID');
   const time = validateVideoPolicy({ windows: value.windows, sessionMinutes: 1, timeZone: value.timeZone });
-  return { version: 1, enabled: value.enabled, timeZone: value.timeZone, windows: time.windows, dailyLimit: value.dailyLimit };
+  // autoStart 缺省按「想开着」处理（老文件没有这个字段），只有明确 false 才表示主人手动停过。
+  return { version: 1, enabled: value.enabled, autoStart: value.autoStart !== false, timeZone: value.timeZone, windows: time.windows, dailyLimit: value.dailyLimit };
 }
 function snapshotMessages(snapshot, recipientId) {
   if (snapshot?.blocked || snapshot?.loginRequired || snapshot?.verificationRequired || (snapshot?.conversation?.id || snapshot?.contact?.id) !== recipientId || !Array.isArray(snapshot?.messages)) throw fail('私信登录状态或会话身份未通过核对，未发送问候。');
@@ -103,6 +106,42 @@ export class SparkService {
     if (!this.runId || !worker?.owned || !worker.alive) { this.running = false; this.abort?.abort(fail('续火花已失去共享进程锁。')); throw fail('续火花已失去共享进程锁，未继续发送。'); }
     return worker;
   }
+  // 2026-11-08：先自愈再调度。以前「上一条问候没拿到回执」会把整轮调度停掉，主人得先手动核对、
+  // 再手动点开始；现在回头读一次那个会话：会话里已经出现这条文案就算发出去了，读不到就按未发送处理，
+  // 两种情况都不再阻塞后面的好友。
+  async healUnconfirmed() {
+    const ledger = this.ledger();
+    const pending = ledger.operations.filter(item => item.status === 'uncertain');
+    if (!pending.length) return 0;
+    let healed = 0;
+    for (const item of pending) {
+      let seen = false;
+      try {
+        const snapshot = await this.browser.readConversation(item.recipientId, { allowed: true, signal: this.abort?.signal });
+        const rows = snapshotMessages(snapshot, item.recipientId);
+        const target = String(item.text || '').replace(/\s+/g, ' ').trim().slice(0, 24);
+        seen = Boolean(target) && rows.slice(-8).some(row => (row.sender || row.direction) === 'outgoing' && String(row.text || '').replace(/\s+/g, ' ').includes(target));
+      } catch { seen = false; }
+      const status = seen ? 'confirmed' : 'not-sent';
+      try {
+        this.control(() => {
+          const next = this.ledger(), operation = next.operations.find(entry => entry.operationId === item.operationId);
+          if (!operation) return;
+          operation.status = status;
+          operation.healedAt = new Date(this.now()).toISOString();
+          operation.completedAt ||= operation.healedAt;
+          operation.reason = seen ? '自动核对：会话里已经出现这条问候。' : '自动核对：会话里没找到这条问候，按未发送处理，不会重发。';
+          write(this.files.ledger, next);
+        });
+        this.note(`heal.${status} ${item.operationId.slice(0, 8)}`);
+        healed += 1;
+      } catch { /* 自愈失败就留着，下次再试，不影响本轮 */ }
+    }
+    if (healed) {
+      try { this.control(() => { const next = this.ledger(); if (next.lastError) { next.lastError = ''; write(this.files.ledger, next); } }); } catch { /* 清不掉就留着，不影响调度 */ }
+    }
+    return healed;
+  }
   unresolved(ledger, worker = this.worker()) {
     return ledger.operations.filter(item => item.status === 'uncertain' || (['reserved', 'sending'].includes(item.status) && !(worker?.alive && worker.runId === item.runId && worker.pid === item.pid && worker.source === item.source)));
   }
@@ -110,7 +149,7 @@ export class SparkService {
     const policy = this.policy(), ledger = this.ledger(), worker = this.worker(), recipients = this.recipients(), date = day(this.now());
     const operations = ledger.operations.filter(item => item.day === date), needsReview = this.unresolved(ledger, worker);
     const stopping = Boolean(worker?.alive && (worker.status === 'stopping' || read(this.files.stop, null)?.targetRunId === worker.runId));
-    return { protocol: 'spark-v1', enabled: policy.enabled, modelReady: Boolean(this.config?.apiKey || this.greetingProvider), running: Boolean(worker?.alive && worker.status === 'running' && !stopping), starting: Boolean(this.starting || worker?.alive && worker.status === 'starting'), stopping, busy: this.busy, worker, timeZone: 'Asia/Shanghai', policy, pollSeconds: this.pollIntervalMs / 1000, inWindow: Boolean(allowedWindow(policy, this.now())), daily: { date, attempts: operations.length, confirmed: operations.filter(item => item.status === 'confirmed').length, limit: policy.dailyLimit, remaining: Math.max(0, policy.dailyLimit - operations.length) }, today: operations.map(item => ({ recipientId: item.recipientId, status: item.status, text: typeof item.text === 'string' ? item.text : '' })), paused: needsReview.length > 0, lastError: ledger.lastError, recipients: recipients.map(contact => { const operation = operations.find(item => item.recipientId === contact.id), check = ledger.contacts[contact.id]; return { ...contact, status: operation?.status || (check?.day === date ? check.status : 'waiting'), reason: operation?.reason || (check?.day === date ? check.reason : '') || '', lastConfirmedAt: ledger.operations.findLast(item => item.recipientId === contact.id && item.status === 'confirmed')?.completedAt || null }; }), needsReview: needsReview.map(({ operationId, recipientId, day, status, startedAt, reason }) => ({ operationId, recipientId, day, status, startedAt, reason })), recent: ledger.operations.slice(-10).map(({ operationId, recipientId, day, status, startedAt, completedAt, messageId, reason }) => ({ operationId, recipientId, day, status, startedAt, completedAt, messageId, reason })) };
+    return { protocol: 'spark-v1', enabled: policy.enabled, modelReady: Boolean(this.config?.apiKey || this.greetingProvider), running: Boolean(worker?.alive && worker.status === 'running' && !stopping), starting: Boolean(this.starting || worker?.alive && worker.status === 'starting'), stopping, busy: this.busy, worker, timeZone: 'Asia/Shanghai', policy, pollSeconds: this.pollIntervalMs / 1000, inWindow: Boolean(allowedWindow(policy, this.now())), daily: { date, attempts: operations.length, confirmed: operations.filter(item => item.status === 'confirmed').length, limit: policy.dailyLimit, remaining: Math.max(0, policy.dailyLimit - operations.length) }, today: operations.map(item => ({ recipientId: item.recipientId, status: item.status, text: typeof item.text === 'string' ? item.text : '' })), paused: false, lastError: ledger.lastError, recipients: recipients.map(contact => { const operation = operations.find(item => item.recipientId === contact.id), check = ledger.contacts[contact.id]; return { ...contact, status: operation?.status || (check?.day === date ? check.status : 'waiting'), reason: operation?.reason || (check?.day === date ? check.reason : '') || '', lastConfirmedAt: ledger.operations.findLast(item => item.recipientId === contact.id && item.status === 'confirmed')?.completedAt || null }; }), skipped: (ledger.skipped?.entries || []).map(item => ({ id: item.id, name: item.name, reason: item.reason })), needsReview: needsReview.map(({ operationId, recipientId, day, status, startedAt, reason }) => ({ operationId, recipientId, day, status, startedAt, reason })), recent: ledger.operations.slice(-10).map(({ operationId, recipientId, day, status, startedAt, completedAt, messageId, reason }) => ({ operationId, recipientId, day, status, startedAt, completedAt, messageId, reason })) };
   }
   configure(input = {}, { explicit = false } = {}) {
     if (!explicit) throw fail('续火花设置只能由用户明确修改。');
@@ -126,7 +165,7 @@ export class SparkService {
     return this.state();
   }
   recover(ledger) {
-    for (const item of ledger.operations) if (['reserved', 'sending'].includes(item.status)) { item.status = 'uncertain'; item.reason = '上次问候在确认前结束，需要人工核对，不会自动重发。'; item.completedAt = new Date(this.now()).toISOString(); }
+    for (const item of ledger.operations) if (['reserved', 'sending'].includes(item.status)) { item.status = 'uncertain'; item.reason = '上次问候在确认前结束，下一轮会自动核对会话确认，不会重发。'; item.completedAt = new Date(this.now()).toISOString(); }
     return ledger;
   }
   async start({ schedule = true, explicit = false, signal } = {}) {
@@ -143,7 +182,6 @@ export class SparkService {
     this.control(() => {
       const worker = this.worker(); if (worker?.alive) throw fail('另一个入口已经运行续火花调度，请使用状态或停止入口。');
       const ledger = this.recover(this.ledger()); write(this.files.ledger, ledger);
-      if (this.unresolved(ledger, null).length) throw fail('有问候发送结果需要人工核对，未开始新的调度。');
       if (ledger.lastError) { ledger.lastError = ''; write(this.files.ledger, ledger); }
       if (worker) fs.unlinkSync(this.files.loop);
       this.runId = randomUUID();
@@ -165,13 +203,33 @@ export class SparkService {
       const trusted = new Set(records.filter(item => Number.isFinite(Date.parse(item.verifiedAt)) && this.now() - Date.parse(item.verifiedAt) <= RELATIONSHIP_MAX_AGE_MS).map(item => item.id));
       // isGroup 由 followed 推出来（见 chat-browser contactList）：跳过整页核对时 following 为空，
       // isGroup 会是 null 而不是 false，这里只排除明确的群聊，未知的交给名字+凭据核对。
-      const mismatched = recipients.filter(contact => !list.contacts?.some(item => item.id === contact.id && (item.name || item.displayName) === contact.name && item.isGroup !== true && (item.followed === true || (!verifyFollowing && item.followed === null && trusted.has(item.id)))));
-      if (list.blocked || list.loginRequired || list.verificationRequired || mismatched.length) throw fail(mismatched.length ? `好友身份或关注关系未通过核对：${mismatched.map(item => item.name).join('、')}，未开始调度。` : '当前好友身份或关注关系未通过核对，未开始调度。');
+      const mismatchOf = contacts => recipients.filter(contact => !contacts?.some(item => item.id === contact.id && (item.name || item.displayName) === contact.name && item.isGroup !== true && (item.followed === true || (!verifyFollowing && item.followed === null && trusted.has(item.id)))));
+      let mismatched = mismatchOf(list.contacts);
+      // 2026-11-07 主人报「主动问候说服务未启动」：面板刚弹开时会话行可能少一行（步月登云），
+      // 旧写法一次读不齐就直接拒绝启动，状态里留下「好友身份或关注关系未通过核对：步月登云」。
+      // 现在只要不是登录/验证阻塞，就再读一次名单；两次都缺才判失败。
+      if (mismatched.length && !list.blocked && !list.loginRequired && !list.verificationRequired) {
+        this.note('start.verify.retry');
+        const again = await this.browser.listContacts({ verifyFollowing, signal: this.abort.signal });
+        this.abort.signal.throwIfAborted(); this.assertOwned();
+        if (again.blocked || again.loginRequired || again.verificationRequired) throw fail('当前好友身份或关注关系未通过核对，未开始调度。');
+        mismatched = mismatchOf(again.contacts);
+      }
+      if (list.blocked || list.loginRequired || list.verificationRequired) throw fail('当前好友身份或关注关系未通过核对，未开始调度。');
+      // 2026-11-07：一位好友换了头像/昵称，会话 id 就会变，名单里再也对不上。旧写法因此让**整个**续火花
+      // 拒绝启动，主人只看到「服务未启动」。现在核对不上的单独跳过并记进状态，剩下的照常调度。
+      const skipped = mismatched.map(item => ({ id: item.id, name: item.name, reason: '会话列表里找不到这位好友（可能换过头像或昵称），本次不问候。' }));
+      this.skipIds = new Set(skipped.map(item => item.id));
+      this.control(() => { const ledger = this.ledger(); ledger.skipped = { at: new Date(this.now()).toISOString(), entries: skipped }; write(this.files.ledger, ledger); });
+      if (skipped.length) this.note('start.verify.skipped ' + skipped.map(item => item.name).join('、'));
+      if (skipped.length && skipped.length >= recipients.length) throw fail(`好友身份或关注关系未通过核对：${skipped.map(item => item.name).join('、')}，未开始调度。`);
       this.control(() => { this.assertOwned(); if (!this.policy().enabled || read(this.files.stop, null)?.targetRunId === this.runId) throw fail('续火花启动许可已撤回。'); write(this.files.loop, { pid: process.pid, source: this.source, runId: this.runId, status: 'running', heartbeatAt: new Date(this.now()).toISOString() }); });
       this.running = true;
       if (schedule) { this.timer = setInterval(() => { void this.tick().catch(() => {}); }, this.pollIntervalMs); this.timer.unref?.(); }
       this.starting = false;
       this.note('start.running');
+      // 2026-11-07：启动成功就记下「想开着」，下次 DSH 启动自动接着跑。
+      try { this.control(() => { const policy = this.policy(); policy.autoStart = true; write(this.files.policy, policy); }); } catch { /* 写不进去不影响本次调度 */ }
       return this.state();
     } catch (error) {
       this.halt(error.message);
@@ -222,6 +280,8 @@ export class SparkService {
     if (!explicit) throw fail('停止续火花需要用户明确操作。');
     this.control(() => { const worker = this.worker(); if (worker?.alive) write(this.files.stop, { targetRunId: worker.runId, requestId: randomUUID(), requestedAt: new Date(this.now()).toISOString() }); });
     if (this.runId) this.halt('用户停止续火花调度。');
+    // 2026-11-07：主人手动停止就关掉开机自启；进程退出走不到这里（halt 由 close 触发时不改这个标记）。
+    try { this.control(() => { const policy = this.policy(); policy.autoStart = false; write(this.files.policy, policy); }); } catch { /* 写不进去就沿用旧值 */ }
     return this.state();
   }
   unresolvedOtherSend(recipientId) {
@@ -243,7 +303,9 @@ export class SparkService {
     const policy = this.policy(), ledger = this.ledger();
     if (!policy.enabled || !allowedWindow(policy, this.now())) throw fail('当前未获续火花许可或不在允许时间段。');
     if (!this.recipients().some(item => item.id === recipientId)) throw fail('好友已不在许可名单。');
-    if (this.unresolved(ledger).length) throw fail('有发送结果需要人工核对，未继续问候。');
+    // 2026-11-08 主人报「问候一条就关了、还得手动核对再手动开启」：
+    // 以前这里一遇到「上一条问候没拿到回执」就整轮拒绝，现在改成先自愈（见 healUnconfirmed），
+    // 自愈不了也只当作这一条没发出去，不影响其他人。
     const date = day(this.now()), own = operationId && ledger.operations.find(item => item.operationId === operationId);
     if (own && (own.day !== date || own.recipientId !== recipientId || own.runId !== this.runId || !['reserved', 'sending'].includes(own.status))) throw fail('问候预留与当前日期或调度不一致。');
     const today = ledger.operations.filter(item => item.day === date);
@@ -262,7 +324,13 @@ export class SparkService {
     this.busy = true;
     this.active = this.performTick().catch(error => {
       try { this.control(() => { this.assertOwned(); const ledger = this.ledger(); ledger.lastError = redact(error.message || String(error), [this.config?.apiKey || '']); write(this.files.ledger, ledger); }); } catch { /* 原状态不可写或归属改变时不重置收据。 */ }
-      this.halt(error.message || '续火花已停止。'); throw error;
+      // 2026-11-08 主人报「问候一条就关了」：以前任何异常都会停机等人重开。
+      // 现在只有「许可被撤回 / 失去进程锁 / 不在允许时段」这类该停的才停，
+      // 页面超时、点名不到、生成失败之类都留给下一轮重试。
+      const fatal = /许可|失去|停止|撤回|不在允许|名单/.test(error.message || '');
+      if (fatal) this.halt(error.message || '续火花已停止。');
+      else this.note(`tick.retry ${redact(error.message || String(error), [this.config?.apiKey || ''])}`);
+      throw error;
     }).finally(() => { this.busy = false; this.active = null; if (!this.running) this.releaseWorker(); });
     return this.active;
   }
@@ -272,9 +340,12 @@ export class SparkService {
     const policy = this.policy();
     if (!policy.enabled || read(this.files.stop, null)?.targetRunId === this.runId) { this.halt('续火花许可已撤回。'); return this.state(); }
     if (!allowedWindow(policy, this.now())) return this.state();
-    if (this.unresolved(this.ledger()).length) throw fail('有未确认问候，需要人工核对。');
+    // 2026-11-08：上一轮没拿到回执的问候先自愈，不再因此停掉整轮调度。
+    await this.healUnconfirmed();
     for (const contact of this.recipients()) {
       signal.throwIfAborted();
+      // 启动时核对不上的好友（换了头像/昵称导致会话 id 变了）不参与本轮调度，也不写任何收据。
+      if (this.skipIds?.has(contact.id)) continue;
       if (this.ledger().operations.some(item => item.recipientId === contact.id && item.day === day(this.now()))) continue;
       if (this.ledger().operations.filter(item => item.day === day(this.now())).length >= this.policy().dailyLimit) break;
       this.allowed(contact.id, null, signal);
@@ -308,17 +379,24 @@ export class SparkService {
           const authorize = async () => { this.allowed(contact.id, operationId, signal); return true; };
           authorize.beginDispatch = () => { const release = this.acquireControl(); try { this.allowed(contact.id, operationId, signal); return release; } catch (error) { release(); throw error; } };
           this.update(operationId, { status: 'sending' });
-          const result = await this.browser.sendMessage(contact.id, greeting.text, { allowed: true, signal, authorize, expectedMessageIds: current.map(item => item.id), expectedMessageContent: current.map(item => ({ id: item.id, fingerprint: messageFingerprint(item) })) });
+          // 2026-11-07 主人报「主动问候一直发不出去」。原因：问候不是回复，对方最后一句常常是
+          // 我们自己说的（甚至好几天前），而 sendMessage 默认要求「最后一条是对方的新消息」，
+          // 于是问候被这句守卫挡成 not-sent。这里明确告诉发送层：这是主动开口的第二条，不是接话。
+          const result = await this.browser.sendMessage(contact.id, greeting.text, { allowed: true, signal, authorize, followUp: true, expectedMessageIds: current.map(item => item.id), expectedMessageContent: current.map(item => ({ id: item.id, fingerprint: messageFingerprint(item) })) });
           if (result?.confirmed === true && (result.deliveryUncertain === true || typeof result.messageId !== 'string' || !result.messageId.trim() || (result.conversation?.id || result.contact?.id) !== contact.id)) return { confirmed: false, deliveryUncertain: true, reason: '问候回执的联系人或消息凭据不完整，需要人工核对。' };
           return result;
         });
         const confirmed = delivery?.confirmed === true && typeof delivery.messageId === 'string' && delivery.messageId.length > 0 && (delivery.conversation?.id || delivery.contact?.id) === contact.id;
         this.update(operationId, { status: confirmed ? 'confirmed' : delivery?.deliveryUncertain ? 'uncertain' : 'not-sent', completedAt: new Date(this.now()).toISOString(), ...(confirmed ? { messageId: delivery.messageId } : {}), reason: confirmed ? '今日问候已确认发送，平台火花状态未验证。' : delivery?.reason || '问候没有取得发送确认，不会自动重发。' });
-        if (!confirmed && delivery?.deliveryUncertain) throw fail('问候发送结果不确定，需要人工核对，不会自动重发。');
+        // 2026-11-08：没拿到回执不再抛错停机（以前这一抛就是「问候一条就关了」）。
+        // 记一条不确定，下一轮 healUnconfirmed() 回头查会话自己收尾；同时继续问候下一位。
+        if (!confirmed) this.note(`tick.${contact.name}.unconfirmed ${delivery?.deliveryUncertain ? 'uncertain' : 'not-sent'}`);
       } catch (error) {
         const operation = this.ledger().operations.find(item => item.operationId === operationId);
         if (operation && ['reserved', 'sending'].includes(operation.status)) this.update(operationId, { status: operation.status === 'sending' && error.beforeDelivery !== true || error.deliveryUncertain ? 'uncertain' : 'not-sent', completedAt: new Date(this.now()).toISOString(), reason: redact(error.message || String(error), [this.config?.apiKey || '']) });
-        throw error;
+        // 2026-11-08：一位好友出问题不再掀桌子——许可/锁这类该停的仍然往上抛，其余记一条就换下一位。
+        if (/许可|失去|停止|撤回|名单/.test(error.message || '')) throw error;
+        this.note(`tick.${contact.name}.failed ${redact(error.message || String(error), [this.config?.apiKey || ''])}`);
       }
     }
     return this.state();

@@ -243,6 +243,63 @@ export async function apply(ctx, config = {}) {
       replyTicker.unref?.();
       disposers.push(() => clearInterval(replyTicker));
     } catch { /* 定时器起不来不影响主功能 */ }
+    // 2026-11-07 主人定：DSH 一启动就把私信自动回复拉起来，不用每次去设置页点「启用私信自动回复」。
+    // 只在「上次是主人自己开着」的时候自动开：策略文件里的 autoStart 为真（启动成功置真、手动停止置假，
+    // 进程退出不改），所以主人手动停过就真的停着，不会被开机自启偷偷打开。
+    // 刚启动时浏览器还没拉起、推荐流也可能没就绪，所以先等 25 秒，失败按 1/2/3/5 分钟再试。
+    const autoStartTimers = [];
+    const startChatOnBoot = async (attempt) => {
+      if (disposed) return;
+      try {
+        if (!modelSettings.state().configured) return;
+        const controller = await getController();
+        const chat = await controller.getChatService();
+        const snapshot = chat.state();
+        if (snapshot.running || snapshot.starting) return;
+        // 只有「明确记着主人手动停过」（autoStart === false）才不自动开；
+        // 老版本策略文件里没有这个字段，按「想开」处理，免得升级后第一次重启又得手点。
+        if (snapshot.policy?.autoStart === false) return;
+        if (!(snapshot.policy?.allowlist || []).length) return;
+        chat.setReplyProvider(createNativeWatchDecision({ llm: optionalService(ctx, 'llm'), attachments: optionalService(ctx, 'attachments'), agent: settingsExec(false).agent, maxTokens: 512 }));
+        await chat.start({ schedule: true });
+      } catch {
+        const next = [60_000, 120_000, 180_000, 300_000][attempt];
+        if (next && !disposed) { const timer = setTimeout(() => { void startChatOnBoot(attempt + 1); }, next); timer.unref?.(); autoStartTimers.push(timer); }
+      }
+    };
+    {
+      const timer = setTimeout(() => { void startChatOnBoot(0); }, 25_000);
+      timer.unref?.();
+      autoStartTimers.push(timer);
+      disposers.push(() => { for (const pending of autoStartTimers) clearTimeout(pending); });
+    }
+    // 2026-11-07 主人定：主动问候也开机自启。等私信那边先起来（45 秒），失败按 1.5/3/5/10 分钟重试。
+    // 有三类情况直接放弃这一轮：主人手动停过（autoStart === false）、许可开关没开、
+    // 还有问候发送结果等人工核对（这时重试也发不出去，得主人先点核对）。
+    const startSparkOnBoot = async (attempt) => {
+      if (disposed) return;
+      try {
+        if (!modelSettings.state().configured) return;
+        const controller = await getController();
+        const spark = await controller.getSparkService();
+        const snapshot = spark.state();
+        if (snapshot.running || snapshot.starting) return;
+        if (snapshot.policy?.autoStart === false) return;
+        if (snapshot.policy?.enabled !== true) return;
+        if (snapshot.paused) return;
+        if (!(snapshot.recipients || []).length) return;
+        spark.setGreetingProvider(createNativeSparkGreeting({ llm: optionalService(ctx, 'llm'), agent: settingsExec(false).agent }));
+        await spark.start({ schedule: true, explicit: true });
+      } catch {
+        const next = [90_000, 180_000, 300_000, 600_000][attempt];
+        if (next && !disposed) { const timer = setTimeout(() => { void startSparkOnBoot(attempt + 1); }, next); timer.unref?.(); autoStartTimers.push(timer); }
+      }
+    };
+    {
+      const timer = setTimeout(() => { void startSparkOnBoot(0); }, 45_000);
+      timer.unref?.();
+      autoStartTimers.push(timer);
+    }
     if (typeof ctx.inject === 'function') {
       // commands 只作为子作用域依赖；缺少该服务时仍注册完整视频工具目录。
       commandFiber = ctx.inject(['commands'], commandCtx => {
@@ -294,19 +351,10 @@ export async function apply(ctx, config = {}) {
                 }
               }
             } catch { /* 私信起不来不影响看视频 */ }
-            // 轮次自然到点结束时也把私信停掉（不是只有点「停止自主观看」才停）。
-            try {
-              const watcher = setInterval(async () => {
-                try {
-                  const current = await getWatch(settingsExec(), false);
-                  if (current.state().running) return;
-                  clearInterval(watcher);
-                  const chat = await (await getController()).getChatService();
-                  if (chat.state().running) chat.stop();
-                } catch { /* 单次检查失败就等下一次 */ }
-              }, 15_000);
-              watcher.unref?.();
-            } catch { /* 看门狗起不来就算了 */ }
+            // 2026-11-07 主人定：刷视频结束（到点或手动停）之后不再顺手停私信。
+            // 旧实现在这里挂了每 15 秒一次的看门狗，一旦自主观看停下就 chat.stop()，
+            // 于是「看完视频私信就哑了」，主人还得回设置页重新点一次启用。现在自动回复
+            // 会一直跑到手动停止（或出错自愈失败）为止。
             return result;
           },
           startSpark: async () => (await getSpark(settingsExec(true), true)).start({ schedule: true, explicit: true }),

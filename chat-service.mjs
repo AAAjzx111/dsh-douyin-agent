@@ -11,7 +11,10 @@ import { OutboundCoordinator } from './outbound-send.mjs';
 const WATCH_SAMPLE_SECONDS = 7.5;
 const WATCH_SAMPLE_FRAMES = 6;
 
-const basePolicy = () => ({ version: 1, enabled: false, allowlist: [], dailyReplyLimit: 40 });
+// 2026-11-07 主人定：DSH 一启动就把私信自动回复拉起来，不用每次手动点。
+// autoStart 记的是「主人希望它开着」这件事：启动成功后置 true，主人手动停止时置 false；
+// 进程退出不算停止，所以下次 DSH 启动会照着这个标记自动恢复。
+const basePolicy = () => ({ version: 1, enabled: false, autoStart: false, allowlist: [], dailyReplyLimit: 40 });
 const dayKey = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 const load = (file, fallback) => fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : fallback;
 const alive = (pid) => { if (!Number.isSafeInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
@@ -87,6 +90,10 @@ export class ChatService {
     this.policy = validatePolicy(load(this.policyFile, basePolicy()));
     this.watermarks = load(this.watermarkFile, { version: 1, contacts: {}, days: {} });
     this.running = false; this.busy = false; this.timer = null; this.abort = null; this.starting = null; this.runId = null; this.heartbeat = null; this.ownershipLost = false;
+    // 2026-11-07：面板开着时对方新消息会被抖音直接标成已读，右上角没有红点、行走也没有红点，
+    // 于是整轮被跳过、永远不回（柒木关那条「那你今天和多少人聊天了」就是这么丢的）。
+    // 兜底：没有红点也每两分钟按顺序抽两位好友读一遍，靠 answered 记账保证不会重复回。
+    this.sweepCursor = 0; this.lastSweepAt = 0;
     this.events = [];
     if (!fs.existsSync(this.watermarkFile)) initialize(this.watermarkFile, this.watermarks);
     if (!fs.existsSync(this.policyFile)) initialize(this.policyFile, this.policy);
@@ -494,6 +501,9 @@ export class ChatService {
       // 白名单是保存时核对过的，这里只读会话列表，找不到就按昵称兜底。
       const contacts = await this.browser.listContacts({ signal, verifyFollowing: false, preferredIds: this.policy.allowlist.map((item) => item.id) }); signal.throwIfAborted();
       if (contacts.blocked || contacts.loginRequired || contacts.verificationRequired) throw new Error('抖音私信页面需要手动处理。');
+      // 2026-11-07：先把「换了头像导致会话 id 变了」的白名单条目重绑到新 id，
+      // 否则下面按旧 id 读会话会抛「指定联系人已变化」，整次启动直接失败。
+      this.rebindContacts(contacts.contacts);
       let readyContacts = 0;
       for (const contact of this.policy.allowlist) {
         // 2026-10-24：按 id 找不到就按昵称兜底（头像/签名变化会让 id 变）；关注关系只在「明确取关」时拒绝，
@@ -523,7 +533,7 @@ export class ChatService {
       }
       if (!readyContacts) throw new Error('白名单联系人在当前会话列表里一个都没找到，未启用自动回复。');
       this.persist(); signal.throwIfAborted();
-      this.control(() => { this.assertOwned(); this.policy.enabled = true; save(this.policyFile, this.policy); save(this.lockFile, { pid: process.pid, runId: this.runId, heartbeatAt: new Date().toISOString(), status: 'running' }); }); this.running = true;
+      this.control(() => { this.assertOwned(); this.policy.enabled = true; this.policy.autoStart = true; save(this.policyFile, this.policy); save(this.lockFile, { pid: process.pid, runId: this.runId, heartbeatAt: new Date().toISOString(), status: 'running' }); }); this.running = true;
       this.log('service.started', { message: '已建立现有消息基线：先补回对方最后几条没回的，之后继续回新消息。' });
       if (schedule) {
         const tick = () => void this.poll().catch((error) => this.log('poll.error', { message: String(error?.message || error).slice(0, 160) }));
@@ -540,7 +550,7 @@ export class ChatService {
       try { await this.browser.closePanel?.(); } catch { /* 关不上不影响结果 */ }
     }
   }
-  stop() {
+  stop(reason = 'user') {
     if (this.ownershipLost) return this.state();
     const worker = this.worker();
     if (this.runId && worker?.owned !== true) { this.loseOwnership(); return this.state(); }
@@ -549,7 +559,14 @@ export class ChatService {
       save(this.stopFile, { targetRunId: worker.runId, requestId: randomUUID(), requestedAt: new Date().toISOString() });
       return { ...this.state(), stopping: true, message: '已向当前回复进程发送停止请求。' };
     }
-    this.running = false; clearInterval(this.timer); this.timer = null; clearTimeout(this.kickoff); this.kickoff = null; if (this._mediaHold) this.releaseWatchHold(); this.abort?.abort(new Error('用户停止私信自动回复。')); this.policy.enabled = false; this.log('service.stopped'); this.release(); return this.state();
+    this.running = false; clearInterval(this.timer); this.timer = null; clearTimeout(this.kickoff); this.kickoff = null; if (this._mediaHold) this.releaseWatchHold(); this.abort?.abort(new Error('用户停止私信自动回复。')); this.policy.enabled = false;
+    // 2026-11-07：只有「主人手动停止」才关掉开机自启；进程退出（close → stop('shutdown')）不算，
+    // 否则每次关 DSH 都会把自动开启也一起取消，下次启动又得手点。
+    if (reason === 'user') {
+      this.policy.autoStart = false;
+      try { save(this.policyFile, this.policy); } catch { /* 写不进去就沿用上一次的状态 */ }
+    }
+    this.log('service.stopped'); this.release(); return this.state();
   }
   resumeContact(id) {
     if (this.running || this.starting || this.busy || this.worker()?.alive) throw new Error('请先停止自动回复，再人工解除联系人暂停。');
@@ -577,8 +594,11 @@ export class ChatService {
           mark.pending.phase = 'superseded'; this.persist();
           return { confirmed: false, deliveryUncertain: false, superseded: true };
         }
+        // knownDraft：上一次中断时我们填进输入框的原文，让发送端能认出「这是自己的残留草稿」并清掉；
+        // 正文不再带任何标记之后，不能靠文本前缀判断了。
+        const knownDraft = typeof mark.pending?.text === 'string' ? mark.pending.text : '';
         entered = true; mark.status = 'inflight'; mark.pending = { ...mark.pending, phase: 'sending', text: reply.text, at: new Date().toISOString() }; this.persist();
-        return this.browser.sendMessage(contact.id, reply.text, { allowed: true, signal, expectedMessageIds: latest.map(item => item.id), expectedMessageContent: expectedContent, followUp });
+        return this.browser.sendMessage(contact.id, reply.text, { allowed: true, signal, expectedMessageIds: latest.map(item => item.id), expectedMessageContent: expectedContent, followUp, knownDraft });
       });
     } catch (error) {
       if (!entered && error.beforeDelivery && error.code === 'OUTBOUND_BUSY') {
@@ -590,6 +610,9 @@ export class ChatService {
     if (delivery?.superseded) { this.log('reply.superseded', { recipientId: contact.id }); return; }
     if (delivery?.confirmed !== true || typeof delivery.messageId !== 'string' || !delivery.messageId.trim()) { mark.status = 'delivery-uncertain'; mark.reason = '未取得发送确认，需人工核对；不会自动重发。'; this.persist(); this.log('delivery.uncertain', { recipientId: contact.id, confirmed: delivery?.confirmed, messageId: delivery?.messageId || null, reason: delivery?.reason || null }); return; }
     mark.status = 'ready'; mark.reason = ''; mark.context.push({ id: delivery.messageId, sender: 'outgoing', text: reply.text }); mark.context = mark.context.slice(-12);
+    // 2026-11-07：回成功一次就把暂停计数清零，否则历史上攒够次数的人会永远停在暂停状态
+    // （覃张驰今天就是被一条「会话标题回读不一致」的偶发错误耗光了恢复额度）。
+    mark.pausedCount = 0; delete mark.pausedAt;
     mark.seen.push(delivery.messageId); delete mark.pending; this.persist();
     this.log('reply.sent', { recipientId: contact.id, text: reply.text, messageId: delivery.messageId, usage: reply.usage });
   }
@@ -604,6 +627,30 @@ export class ChatService {
     // 微光那条「滴滴滴」就是这么漏的。现在反过来：只有明确是旧日期的才不补，其余一律补。
     const looksOld = /^\d{4}[-/年]|\d{1,2}\s*月\s*\d{1,2}\s*日|\d+\s*(?:天|周|个月|年)前|星期[一二三四五六日天]|^\d{1,2}-\d{1,2}$/.test(raw);
     return looksOld ? [] : tail;
+  }
+  // 2026-11-07 主人报「没有自动回复 / 主动问候说服务未启动」。查出来的其中一条：会话 id 是
+  // 「昵称 + 头像」的哈希，好友一换头像 id 就变，白名单里存的旧 id 再也对不上——
+  // 自动回复每次判「指定联系人已变化」并永久暂停，续火花预检整轮拒绝启动。
+  // 这里只在「昵称唯一 + 互相关注 + 非群聊」时把白名单重绑到新 id，水位记录跟着搬过去，并留一条事件。
+  rebindContacts(rows) {
+    if (!Array.isArray(rows) || !rows.length) return 0;
+    let changed = 0;
+    for (const entry of this.policy.allowlist) {
+      if (rows.some(item => item.id === entry.id)) continue;
+      const candidates = rows.filter(item => (item.name || item.displayName) === entry.name && item.isGroup !== true && item.followed === true);
+      if (candidates.length !== 1) continue;
+      const target = candidates[0], previous = entry.id;
+      entry.id = target.id;
+      entry.name = target.name || target.displayName;
+      entry.followed = true; entry.isGroup = false;
+      entry.verifiedAt = new Date().toISOString();
+      const mark = this.watermarks.contacts?.[previous];
+      if (mark) { delete this.watermarks.contacts[previous]; this.watermarks.contacts[target.id] = mark; }
+      changed += 1;
+      this.log('contact.rebound', { from: previous, to: target.id, name: entry.name, message: '好友换过头像或昵称，会话 id 变了，已按昵称重新绑定。' });
+    }
+    if (changed) this.control(() => { this.assertOwned(); save(this.policyFile, this.policy); this.persist(); });
+    return changed;
   }
   async poll() {
     if (!this.running || this.busy) { this.log('poll.skip', { running: this.running, busy: this.busy }); return; }
@@ -623,21 +670,52 @@ export class ChatService {
       // 2026-10-25 主人定：轮询先看右上角「消息」红数字，是 0 就整轮不开面板；开轮时 begin() 的全量核对不受影响，
       // 「手机上看了没回」那种没有红点的情况由开轮那次补上。有未确认发送/待发内容的联系人时必须照旧读，否则没法定夺。
       // 有待补发的联系人也不能跳过：没有红点（手机上读过）但末尾还有没回的消息，就靠这一轮补。
-      const needsRead = Object.values(this.watermarks.contacts).some((item) => ['delivery-uncertain', 'inflight'].includes(item?.status) || item?.pending?.phase === 'outbound-wait' || item?.catchup === true);
+      const needsRead = Object.values(this.watermarks.contacts).some((item) => item?.status !== 'paused' && (['delivery-uncertain', 'inflight'].includes(item?.status) || item?.pending?.phase === 'outbound-wait' || item?.catchup === true));
+      // 2026-11-07：没有红点时也不能永远不读（见构造函数里的注释）。到点就抽五人读一遍。
+      // 2026-11-08 11:22：兜底扫描别再被 needsRead 挡住——入机-66 那条 catchup 标记没清干净，
+      // 于是每次都被判成「还有待读」，sweep 一分钟也不跑。扫描和「有待确认的发送」是两件事。
+      const sweepDue = Date.now() - (this.lastSweepAt || 0) > 60_000;
       if (!needsRead) {
         let badge = null;
         try { badge = await this.browser.unreadCount(); } catch { badge = null; }
-        if (badge?.ok === true && badge.count === 0) { this.log('poll.skipped_no_badge', { message: '右上角消息没有红点，这一轮不打开私信面板。' }); return; }
+        if (badge?.ok === true && badge.count === 0 && !sweepDue) { this.log('poll.skipped_no_badge', { message: '右上角消息没有红点，这一轮不打开私信面板。' }); return; }
       }
       // 2026-10-25：面板反正要开，开的时候顺手读一次会话列表，按每一行自己的小红点决定要不要进这个会话。
       try {
         const listed = await this.browser.listContacts({ signal, verifyFollowing: false, preferredIds: this.policy.allowlist.map((item) => item.id) });
         const rows = Array.isArray(listed?.contacts) ? listed.contacts : [];
         if (!listed?.blocked && rows.length) {
+          this.rebindContacts(rows);
           const plan = planUnreadFilter({ rows, allowlist: this.policy.allowlist, mustRead });
           unreadIds = plan.unread;
           this.log('poll.unread_rows', { rows: plan.rows, read: plan.unread.size, missing: plan.missing.length });
-          if (!plan.anyWhitelist) {
+          // 2026-11-07：红点一个都没有时，按顺序抽几位好友做兜底扫描（每分钟一次），
+          // 否则「面板开着 → 消息被标已读 → 没有红点 → 永远不读」会一直静默吞消息。
+          // 2026-11-07 21:00 主人定：主人会在手机上先看掉红点，桌面这边就永远等不到红点，
+          // 所以一次抽五位，十个人两分钟转一圈（原来是三位、三四分钟一圈，主人嫌慢）。
+          // 2026-11-08 11:15 主人报「入机66的消息怎么又没回了」：兜底扫描原来要求「一个红点都没有」，
+          // 可只要有一个红点挂在暂停的好友身上（步月登云的会话已经不在了，红点一直留着），sweep 就永远不跑，
+          // 于是「在手机上先看掉红点」的那些会话一条都不会被读。现在改成到点就扫，
+          // 只跳过本轮已经要读的、以及暂停中的联系人（暂停的读也读不出结果，白等 10 秒）。
+          if (sweepDue && this.policy.allowlist.length) {
+            const already = new Set(plan.unread);
+            const targets = [];
+            for (let step = 0; step < this.policy.allowlist.length && targets.length < 5; step += 1) {
+              const contact = this.policy.allowlist[(this.sweepCursor + step) % this.policy.allowlist.length];
+              if (targets.includes(contact.id) || already.has(contact.id)) continue;
+              if (this.watermarks.contacts[contact.id]?.status === 'paused') continue;
+              targets.push(contact.id);
+            }
+            if (targets.length) {
+              this.sweepCursor = (this.sweepCursor + targets.length) % this.policy.allowlist.length;
+              this.lastSweepAt = Date.now();
+              unreadIds = new Set([...plan.unread, ...targets]);
+              this.log('poll.blind_sweep', { recipients: targets, message: '到点兜底读一次，不看红点。' });
+            }
+          }
+          // 2026-11-07：兜底扫描已经指定了要读的人，就不能再被「红点都不在白名单」这条提前返回掐掉
+          // ——上一版就是这样：日志记了 blind_sweep，紧接着 return，谁也没读（捌宁那条就是这么卡住的）。
+          if (!plan.anyWhitelist && !(unreadIds && unreadIds.size)) {
             try { this.browser.releasePanel?.(); await this.browser.closePanel?.(); } catch { /* 关不上不影响这一轮跳过 */ }
             this.log('poll.no_whitelist_unread', { message: '红点都不在白名单会话上，这一轮不逐个读。' });
             return;
@@ -648,7 +726,11 @@ export class ChatService {
         this.log('poll.unread_rows_failed', { message: String(error?.message || error).slice(0, 120) });
       }
       for (const contact of this.policy.allowlist) {
-        signal.throwIfAborted(); this.assertOwned(); const mark = this.watermarks.contacts[contact.id];
+        signal.throwIfAborted(); this.assertOwned();
+        // 2026-11-07：白名单里新加的联系人还没有水位记录，旧写法拿不到 mark 就直接 continue，
+        // 于是「加进白名单了却永远不回」。这里补一条空的 ready 记录，之后按正常流程判。
+        let mark = this.watermarks.contacts[contact.id];
+        if (!mark) { mark = { status: 'ready', seen: [], context: [], unanswered: [], catchup: false, catchupTries: 0, startedAt: new Date().toISOString(), lastCheckedAt: null }; this.watermarks.contacts[contact.id] = mark; }
         // 2026-10-24 主人定：发送未确认不再等人点「已人工核对」，下一次轮询自己核对：
         // 会话里找到刚发的那条就算已发，找不到就清掉标记、下一次重新回。
         if (mark && mark.status === 'delivery-uncertain') {
@@ -663,6 +745,24 @@ export class ChatService {
             this.log(delivered ? 'delivery.confirmed_auto' : 'delivery.cleared_auto', { recipientId: contact.id });
           } catch (error) { this.log('delivery.check_failed', { recipientId: contact.id, message: String(error?.message || error).slice(0, 120) }); }
           continue;
+        }
+        // 2026-11-07 主人报「怎么没有自动回复」：paused 之后没有任何重试，一次「会话没点开」就把这位好友永久静音。
+        // 现在暂停满 6 分钟、且累计恢复不超过 20 次，就放回 ready 再试一轮（失败会重新记 pausedAt）。
+        // 2026-11-07 21:05：恢复额度原来是 5 次，覃张驰一天里被几次偶发的「标题回读不一致」耗光就再也不试了；
+        // 另外回成功一次会把计数清零（见 deliverReply），正常好友不会攒到上限。
+        if (mark?.status === 'paused' && (mark.pausedCount ?? 0) < 20 && Date.now() - (Date.parse(mark.pausedAt || '') || 0) > 6 * 60_000) {
+          // 2026-11-08：步月登云的会话已经不在列表里了，旧写法每 6 分钟复活一次、每次都失败
+          // （日志里 attempts 一路涨到 5），既白开一轮浏览器，也把「暂停」刷成噪音。
+          // 现在先看这次列表里有没有这个人：没有就只推迟下次检查，不复活；等他再发消息出现再说。
+          if (this.browser.contacts && !this.browser.contacts.has(contact.id)) {
+            mark.pausedAt = new Date().toISOString();
+            mark.reason = '会话列表里暂时找不到这位好友（可能改名或删了会话），等再次出现再回。';
+            this.persist();
+            continue;
+          }
+          mark.status = 'ready'; mark.reason = ''; mark.pausedCount = (mark.pausedCount ?? 0) + 1;
+          delete mark.pausedAt; this.persist();
+          this.log('contact.revived', { recipientId: contact.id, attempts: mark.pausedCount });
         }
         if (!mark || mark.status !== 'ready') continue;
         // 没有未读角标就不开会话；只更新检查时间（2026-10-24）。
@@ -707,6 +807,21 @@ export class ChatService {
           mark.seen = [...seen, ...discovered.map((item) => item.id)].slice(-2000); mark.lastCheckedAt = new Date().toISOString(); this.persist();
           this.log('poll.messages', { recipientId: contact.id, total: messages.length, discovered: discovered.length, incoming: discovered.filter(item => item.sender === 'incoming').length, fresh: fresh.length });
           if (oldHistory.length) this.log('message.old_history_skipped', { recipientId: contact.id, messageIds: oldHistory.map((item) => item.id), message: '已知旧窗口或加载的历史行只更新水位，不回复。' });
+          // 2026-11-07 20:12 主人报「青骑三月和柒木关又没回了」：追踪器把「刚回过之后又来的一条」也标成
+          // known-old-window（它按窗口内位置判断，不看是谁最后说话），进 oldHistory 后被下面那句 continue 吞掉；
+          // 而且上面的 mark.seen 已经把它记成「看过」，之后永远不再当成新消息——表现就是回过一次就再也不回。
+          // 白名单好友必回，所以这里按「会话尾部、我方之后、还没回过的」直接捞回来，按补回处理。
+          if (!fresh.length) {
+            const answeredIds = new Set(mark.answered || []);
+            const tailCut = messages.findLastIndex((item) => item.sender === 'outgoing');
+            const trailing = messages
+              .filter((item, index) => index > tailCut && item.sender === 'incoming' && !answeredIds.has(item.id))
+              .slice(-5);
+            if (trailing.length) {
+              fresh.push(...trailing.map((item) => ({ ...item, catchup: true })));
+              this.log('message.tail_rescued', { recipientId: contact.id, messageIds: trailing.map((item) => item.id), message: '会话尾部还有没回的消息，按补回处理。' });
+            }
+          }
           if (!fresh.length) continue;
           const supported=item=>item.unsupported!==true && (item.media && ['emoji','shared-work'].includes(item.media.type) || (!item.kind||item.kind==='text') && (!item.type||item.type==='text') && typeof item.text==='string' && item.text.trim());
           const unsupported = fresh.filter((item) => item.sender === 'incoming' && !supported(item));
@@ -718,6 +833,16 @@ export class ChatService {
           // 旧逻辑直接把联系人暂停（「只已读不回」就是这么来的）。现在只回「有资格」或「启动补发」的那几条，
           // 更早的历史行只更新水位、不回复，也不暂停。
           const answerable = incoming.filter((item) => item.eligibleForReply === true || item.catchup === true);
+          // 2026-11-07 主人报「18:04 的表情、脑花 6 点多、入机-66 的消息都没回」：
+          // 追踪器把「服务重启/换窗口之后才第一次读到、但确实是对面最后说的话」标成 baseline / old-history / ambiguous-new，
+          // 旧逻辑只认 new-tail，于是这几条永远挂在 unqualified——表现就是已读不回。
+          // 白名单好友必回（主人 2026-10-24 定），所以再加一条兜底：消息在会话尾部、后面没有我方发言，就回一次；
+          // 回过的 id 记进 mark.answered，同一条不会重复回。
+          const answeredIds = new Set(mark.answered || []);
+          const tailCut = messages.findLastIndex((item) => item.sender === 'outgoing');
+          const trailAnswerable = incoming.filter((item) => !answeredIds.has(item.id)
+            && messages.findIndex((current) => current.id === item.id) > tailCut);
+          for (const item of trailAnswerable) if (!answerable.includes(item)) answerable.push(item);
           if (!answerable.length) { mark.pending = { phase: 'unqualified', incoming: incoming.map((item) => ({ id: item.id, text: item.text })), at: new Date().toISOString() }; this.persist(); continue; }
           incoming.splice(0, incoming.length, ...answerable);
           const lastIncoming = messages.findLastIndex((item) => incoming.some((freshItem) => freshItem.id === item.id));
@@ -761,12 +886,18 @@ export class ChatService {
           // 2026-10-24 主人定：白名单用户必回，所以“生成期间又来了新消息”不再作为放弃发送的理由
           // （撤回/改动/方向不明仍然在第 350 行拦着）。
           await this.deliverReply(contact, mark, reply, latest, signal);
-          // 补发成功（pending 已被清掉）就收工；失败两次也不再挂着，免得红点门控一直为此开面板。
-          if (mark.catchup && (!mark.pending || (mark.catchupTries || 0) >= 2)) { mark.catchup = false; this.persist(); }
+          // 2026-11-07：记下这次回过哪几条，兜底判据下同一句话不会因为分类抖动被回第二遍。
+          mark.answered = [...new Set([...(mark.answered || []), ...incoming.map((item) => item.id)])].slice(-200);
+          this.persist();
+          // 补发成功（pending 已被清掉）就收工。
+          // 2026-11-08 11:22：原来只在「pending 已清」时才清 catchup，实测出现过 catchup 一直是 true、
+          // 把 needsRead 永久点亮、连带把兜底扫描一起挡住的情况。既然这一轮已经真的回了，标记就该收掉。
+          if (mark.catchup) { mark.catchup = false; mark.catchupTries = 0; this.persist(); }
         } catch (error) {
           if (mark.status === 'inflight') { mark.status = 'delivery-uncertain'; mark.reason = '发送被中断，需要人工核对。'; }
           else { mark.status = 'paused'; mark.reason = signal.aborted ? '用户停止时有未答消息，已保留在本机，未发送。' : redact(error.message, [this.config?.apiKey]); if (signal.aborted && mark.pending) mark.pending.phase = 'stopped-before-send'; }
           this.persist(); if (!signal.aborted) this.log('contact.paused', { recipientId: contact.id, message: mark.reason });
+          if (mark.status === 'paused' && !signal.aborted) mark.pausedAt = new Date().toISOString();
         }
       }
     } finally {
@@ -777,5 +908,5 @@ export class ChatService {
       if (!this.running) this.release();
     }
   }
-  async close() { if (this.runId) this.stop(); while (this.busy || this.starting) await new Promise((resolve) => setTimeout(resolve, 20)); await this.browser.close?.(); if(this.inspectorPromise) await this.inspectorPromise.then(inspector=>inspector.close()).catch(()=>{}); }
+  async close() { if (this.runId) this.stop('shutdown'); while (this.busy || this.starting) await new Promise((resolve) => setTimeout(resolve, 20)); await this.browser.close?.(); if(this.inspectorPromise) await this.inspectorPromise.then(inspector=>inspector.close()).catch(()=>{}); }
 }

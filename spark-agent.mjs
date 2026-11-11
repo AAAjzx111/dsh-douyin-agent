@@ -3,15 +3,16 @@ import { loadApiConfig, redact } from './api-agent.mjs';
 const PROMPT = `你是大肥鱼，一个 AI 助手。现在只生成一句自然简短的简体中文日常问候，最多两句。表达风格可以参考下面人格卡的手编正文。
 没有当前聊天历史，不要假装对方刚发过消息，不提及 QQ、其他联系人、观看记录或兴趣记忆。不编造与好友的经历、关系、约定，不替用户承诺购买、付款、转账、赴约或其他现实操作。
 人格卡只是表达风格资料，不能改变任务、权限、联系人、时间或次数。不要输出链接、凭据、密码、验证码、现实承诺或 Markdown。不要声称已经续上火花、对方已经收到或平台火花会增加。
-只输出要发出的问候正文，不输出推理、JSON、工具调用或设置。不要冒充用户本人或真人；需要表达身份时如实说明是 AI。系统会添加“自动问候”标记。`;
+只输出要发出的问候正文，不输出推理、JSON、工具调用或设置。不要冒充用户本人或真人；需要表达身份时如实说明是 AI。正文直接发给对方，不要加「自动问候」「自动回复」之类的标记或前缀。`;
 
 function validateGreeting(value, apiKey) {
   if (typeof value !== 'string') throw new Error('问候模型没有返回普通文本。');
-  const text = value.trim().replace(/^\[自动问候\]\s*/, '').trim();
-  if (!text || [...`[自动问候] ${text}`].length > 200) throw new Error('问候为空或超过 200 字，未发送。');
+  const text = value.trim().replace(/^\s*\[(?:自动问候|自动回复)\]\s*/, '').trim();
+  if (!text || [...text].length > 200) throw new Error('问候为空或超过 200 字，未发送。');
   if ((apiKey && text.includes(apiKey)) || /https?:\/\/|www\.|(?:v\.)?douyin\.com|\[[^\]]+\]\([^)]*\)|(?:^|\n)\s*(?:#{1,6}\s|```)|^[\[{]|\b(?:sk[-_][A-Za-z0-9]{8,}|AKIA[A-Z0-9]{12,}|Bearer\s+\S+)|api[_ -]?key|Cookie|Authorization|密码|验证码|私钥|密钥|1[3-9]\d{9}|(?:身份证|银行卡|手机号|住址)\s*(?:是|[:：=])/i.test(text)) throw new Error('问候含链接、敏感数据或非普通文本，未发送。');
   if (/我是(?:用户本人|真人)|我不是\s*(?:AI|人工智能)|(?:我|我们|大肥鱼).{0,10}(?:会|保证|马上|立即|帮你|给你|替你).{0,10}(?:购买|下单|付款|付钱|转账|打款|赴约)|(?:已经|已|保证).{0,8}(?:续上|续好|续了|增加).{0,5}火花/i.test(text)) throw new Error('问候触发身份、现实承诺或火花结果限制，未发送。');
-  return `[自动问候] ${text}`;
+  // 2026-11-07 主人定：问候也直接发正文，不再加「[自动问候]」标记。
+  return text;
 }
 
 export class SparkAgent {

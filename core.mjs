@@ -57,8 +57,11 @@ async function wait(ms, signal) { await delay(ms, undefined, { signal }); }
 // this.queue —— 只要有一个 await 永远不 settle，后面所有抖音工具都排在它后面，整轮死锁。
 // 这里给每次操作加硬超时：到点就放弃并抛出明确错误，队列照常放行。
 // 超时后底层调用仍在跑（JS 取消不了），但它不再堵住队列；下次操作会重新核对页面状态。
-const PAGE_DEADLINE_MS = 90_000;
-const SERVICE_DEADLINE_MS = 180_000;
+// 2026-11-06：宿主给单次工具调用只有 90 秒，原来 PAGE/SERVICE 也定在 90/180 秒，
+// 结果宿主先超时，插件自己那句中文报错永远出不来，主人只看得到「timed out after 90000ms」。
+// 现在压到 75/88 秒：真卡住时先抛插件自己的 TOOL_TIMEOUT，队列照常放行。
+const PAGE_DEADLINE_MS = 75_000;
+const SERVICE_DEADLINE_MS = 88_000;
 export function withDeadline(promise, ms, label) {
   const source = Promise.resolve(promise);
   source.catch(() => {}); // 超时之后迟到的失败不再算未处理的拒绝
@@ -261,6 +264,8 @@ export class BrowserController {
     if (!['api','dsh','verification','api-chat','dsh-chat'].includes(source)) throw new TypeError('不支持这个浏览器入口。');
     this.source = source; this.memory = memory; this.personaMemory = personaMemory; this.browser = null; this.page = null;
     this.queue = Promise.resolve();
+    // 当前是否正跑在 this.queue 的任务内部（execute/openBrowser）。>0 时 withPage 不再排队，避免排到自己后面。
+    this.insideQueue = 0;
     this.videoLimits = videoLimits;
     this.limitsEnabled = ['api','dsh'].includes(source);
   }
@@ -583,6 +588,22 @@ export class BrowserController {
     return { picks, total: (list || []).length, scoped: scoped.length, source: picks.length ? source : 'empty', text: formatDanmaku(picks) };
   }
   withPage(callback,{signal}={}) {
+    // 2026-11-07 主人报「重启后读联系人还是 88 秒超时」：execute() 已经把整次工具调用排进 this.queue，
+    // 而私信/续火花/转发复用同一个 controller，里面的 withPage 又排一次队 —— 等于排到自己后面，
+    // 永远等不到（实测 execute('douyin_chat_contacts') 卡满 88 秒，直连 listContacts 只要 25 秒）。
+    // 已经在队列任务里就不再排队，直接复用当前标签页，只保留页面级超时。
+    // 这里刻意不做 watch mode 的 apply：读私信不该顺手改动推荐流（早前那次「推荐流尚未读到就绪视频」就是它）。
+    if (this.insideQueue > 0) return withDeadline((async()=>{
+      // 队列不再排，但跨进程的标签页锁照旧：自主观看的 worker 可能正在同一个页面上操作。
+      const release=await lock(`tab-${this.source}`,signal);
+      try {
+        aborted(signal);
+        const page=await this.connect(signal);
+        aborted(signal);
+        if(new URL(page.url()).origin!=='https://www.douyin.com') throw new Error('专用标签页已离开抖音，请重新打开抖音后操作。');
+        return callback(page,signal);
+      } finally { release(); }
+    })(), PAGE_DEADLINE_MS, `浏览器操作（${this.source}）`);
     const operation=this.queue.catch(()=>{}).then(async()=>{
       const release=await lock(`tab-${this.source}`,signal);
       const onAbort=()=>{this.browser?.close().catch(()=>{});};
@@ -604,6 +625,8 @@ export class BrowserController {
     try { validateToolArguments(definition,args); } catch(error) { return Promise.reject(error); }
     const operation = this.queue.catch(()=>{}).then(async()=>{
       let releaseNativeLease;
+      // 这一段在队列任务内部：期间 through withPage 的调用直接复用当前页，不再排队（见 withPage 顶部注释）。
+      this.insideQueue += 1;
       try {
       aborted(signal);
       if(this.source==='dsh'&&!autonomousRunId&&VIDEO_ACTIONS.has(name)) releaseNativeLease=await acquireNativeVideoLease(this.limits().stateDir,signal);
@@ -717,7 +740,7 @@ export class BrowserController {
         aborted(signal);
         return this.state();
       } finally { signal?.removeEventListener('abort',onAbort); release(); }
-      } finally { await releaseNativeLease?.(); }
+      } finally { this.insideQueue -= 1; await releaseNativeLease?.(); }
     });
     this.queue=operation; return operation;
   }

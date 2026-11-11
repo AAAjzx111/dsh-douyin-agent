@@ -7,6 +7,8 @@ import { MessageIdentityTracker } from './message-tracker.mjs';
 export { MessageIdentityTracker } from './message-tracker.mjs';
 
 const HOME = 'https://www.douyin.com/?recommend=1&from_nav=1';
+// 本人主页：比「首页 → 我的 → 个人页」少两次导航，关注名单就在这一页的「关注」角标上。
+const PROFILE = 'https://www.douyin.com/user/self';
 const hash = value => createHash('sha256').update(value).digest('hex');
 const stop = signal => signal?.throwIfAborted();
 // 2026-10-31：读「我的关注」名单。原来的实现依赖抖音的哈希类名（.OlxToPIh / .Zce7SWd3），
@@ -59,12 +61,24 @@ export function analyzeConversationDay(snapshot, { now = Date.now, confirmedHist
   if (snapshot?.blocked || snapshot?.loginRequired || snapshot?.verificationRequired || !recipientId || !Array.isArray(snapshot.messages) || (evidence && !Number.isFinite(Date.parse(evidence.observedAt)))) return { status: 'date-unknown', reason: '会话没有读到，或登录/验证状态不明。' };
   const messages = snapshot.messages;
   if (messages.some(item => !['incoming', 'outgoing'].includes(item.sender || item.direction) || item.pending || item.failed)) return { status: 'date-unknown', reason: '会话含方向不明或未确认的消息，未自动问候。' };
+  // 2026-11-07 主人报「主动问候全是没动静」：会话列表末尾常常挂着一条「没有文字、没有表情、没有分享卡」的空壳行
+  // （实测 入机-66 第 11 条：kind=unsupported、text=''、时间标签为空），旧逻辑把它当成「最后一条消息」，
+  // 时间读不出来就整轮判 date-unknown，于是一个都不问候。这里先把它滤掉，用最后一条真消息判日期。
+  const real = messages.filter(item => item.kind !== 'unsupported' || item.text || item.media);
   const dayOf = item => {
     const kind = item.dateEvidence?.kind;
     if (kind === 'today') return today;
     if (kind === 'yesterday') return yesterday;
     if (kind === 'before-yesterday') return localDay(current - 2 * 86_400_000);
-    const raw = String(item.dateEvidence?.raw ?? item.sentAt ?? item.timestamp ?? '').trim();
+    // 时间证据常常只有 relativeTime（「15:47」），raw 却是空串；用 || 才能落到 sentAt/timestamp 上。
+    const raw = String(item.dateEvidence?.raw || item.sentAt || item.timestamp || '').trim();
+    // 只有时分（「15:47」「刚刚」）＝今天；「昨天 14:45」「前天 09:01」按字面算。
+    if (/^(?:刚刚|今天)(?:\s|$)/.test(raw) || /^\d{1,2}:\d{2}(?::\d{2})?$/.test(raw)) return today;
+    // 「48分钟前」「3小时前」这种相对时间也是今天（实测两条 date-unknown 就是它：raw="48分钟前"）。
+    if (/^\d+\s*(?:秒|分钟|小时)前$/.test(raw)) return today;
+    if (/^\d+\s*天前$/.test(raw)) return localDay(current - Number(/^(\d+)/.exec(raw)[1]) * 86_400_000);
+    if (/^昨天/.test(raw)) return yesterday;
+    if (/^前天/.test(raw)) return localDay(current - 2 * 86_400_000);
     const monthDay = /^(\d{1,2})[-/月](\d{1,2})日?(?:$|[ T\s])/.exec(raw);
     if (monthDay && kind === 'month-day') {
       const year = Number(today.slice(0, 4));
@@ -80,12 +94,16 @@ export function analyzeConversationDay(snapshot, { now = Date.now, confirmedHist
   };
   // 2026-10-30 主人定的规则只有一条：今天没发过消息，就直接问候。
   // 证据就看会话里的时间分隔条（刚刚 / 09:01 / 昨天 14:45），不再纠缠「最新端是否已核实」。
-  const lastOutgoing = messages.findLastIndex(item => (item.sender || item.direction) === 'outgoing');
-  if (lastOutgoing >= 0 && dayOf(messages[lastOutgoing]) === today) return { status: 'already-sent', reason: '当前会话已读到今天真实发出的消息。' };
-  if (!messages.length) return { status: 'eligible', reason: '会话里还没有消息，今天没发过。' };
-  const lastDay = dayOf(messages[messages.length - 1]);
-  if (!lastDay) return { status: 'date-unknown', reason: '最后一条消息的时间标签认不出来，不自动问候。' };
-  if (lastDay < today) return { status: 'eligible', reason: `最后一条消息是 ${lastDay}，今天还没发过。` };
+  // 2026-11-07：会话尾巴上经常挂着没有时间标签的行（群标签、空壳行、系统提示），
+  // 只按「最后一条」判日期会让整轮卡在 date-unknown（实测 青骑三月、捌宁 就是这种）。
+  // 改成往前找最近一条**有时间标签**的消息来定日期。
+  const dated = real.map(item => ({ item, day: dayOf(item) }));
+  const lastOutgoing = [...dated].reverse().find(entry => (entry.item.sender || entry.item.direction) === 'outgoing' && entry.day);
+  if (lastOutgoing?.day === today) return { status: 'already-sent', reason: '当前会话已读到今天真实发出的消息。' };
+  if (!real.length) return { status: 'eligible', reason: '会话里还没有消息，今天没发过。' };
+  const lastKnown = [...dated].reverse().find(entry => entry.day);
+  if (!lastKnown) return { status: 'date-unknown', reason: '最后一条消息的时间标签认不出来，不自动问候。' };
+  if (lastKnown.day < today) return { status: 'eligible', reason: `最后一条消息是 ${lastKnown.day}，今天还没发过。` };
   return { status: 'eligible', reason: '对方今天留了话，今天还没发过——问候充当回应。' };
 }
 
@@ -145,10 +163,17 @@ export function readConversationDom() {
     return 'unknown';
   };
   const dialog = document.querySelector('[data-e2e="im-dialog"]');
-  const headers = [...(dialog?.querySelectorAll('.StackLayoutStackChatHeaderuser,[data-e2e="chat-header"]') ?? [])].filter(visible);
-  const header = headers.length === 1 ? headers[0] : null;
+  // 2026-11-07：DOM 里常驻 7 个 ChatHeader 节点，关掉面板也不销毁，旧的「数量为 1 才算」永远不成立。
+  // 现在只认落在可见面板矩形内、且标题非空的那个；标题里的 U+00A0 也统一成普通空格。
+  const panel = dialog?.getBoundingClientRect();
+  const inPanel = element => {
+    const rect = element.getBoundingClientRect();
+    return rect.width > 20 && rect.height > 10 && panel && rect.left >= panel.left - 8 && rect.right <= panel.right + 8 && rect.top >= panel.top - 8 && rect.bottom <= panel.bottom + 8;
+  };
+  const headers = [...(dialog?.querySelectorAll('.StackLayoutStackChatHeaderuser,[data-e2e="chat-header"]') ?? [])].filter(inPanel);
+  const header = headers.find(element => clean(element.querySelector('.StackLayoutStackChatHeadertitle,[data-e2e="chat-title"]')?.textContent)) || headers[0] || null;
   const root = header?.closest('.StackLayoutpagespageRoot,[data-e2e="chat-page"]');
-  const displayName = clean(header?.querySelector('.StackLayoutStackChatHeadertitle,[data-e2e="chat-title"]')?.textContent);
+  const displayName = clean(header?.querySelector('.StackLayoutStackChatHeadertitle,[data-e2e="chat-title"]')?.textContent)?.replace(/[\u00A0\u2007\u202F]/g, ' ').replace(/\s+/g, ' ').trim();
   const avatar = resource(header?.querySelector('img')?.getAttribute('src'));
   let timestamp = null;
   const messages = [];
@@ -168,16 +193,23 @@ export function readConversationDom() {
     const fromMe = Boolean(node.closest('.MessageBoxContentisFromMe,.messageMessageBoxisFromMe,[data-direction="outgoing"]'));
     const direction = fromMe ? 'outgoing' : box.matches('.messageMessageBoxmessageBox,[data-e2e="message-row"]') ? 'incoming' : 'unknown';
     const textNode = node.querySelector('.MessageItemTextcontainer,[data-e2e="message-text"]');
-    const emoji = node.querySelector('.MessageItemEmojiemojiBox');
+    // 2026-11-07 主人报「18:04 覃张驰发的是表情，没有回」：单独发的表情有两种渲染——
+    // 独立的表情盒子 emojiBox，或者「文字气泡里只有一个 .TextMessageTextemoji」。
+    // 后者 innerText 是空串，旧逻辑判成 kind=text 但 text=''，随后被 supported() 当成不支持直接丢掉。
+    const emojiBox = node.querySelector('.MessageItemEmojiemojiBox');
+    const inlineEmoji = textNode?.querySelector('.TextMessageTextemoji');
     const share = node.querySelector('.MessageItemShareAwemecontainer');
-    const kind = textNode ? 'text' : emoji ? 'emoji' : share ? 'video' : 'unsupported';
-    const text = textNode ? clean(textNode.innerText || textNode.textContent) : '';
+    const kind = textNode ? 'text' : emojiBox ? 'emoji' : share ? 'video' : 'unsupported';
+    let text = textNode ? clean(textNode.innerText || textNode.textContent) : '';
     let media = null;
-    if (emoji) {
-      const images = [...emoji.querySelectorAll('img')].map(image => ({ src: image.currentSrc || image.getAttribute('src') || '', label: clean(image.getAttribute('alt') || image.getAttribute('aria-label') || image.getAttribute('title')) || null }));
-      const label = clean(emoji.getAttribute('aria-label') || emoji.getAttribute('title')) || images.map(image => image.label).filter(Boolean).join(' ') || null;
-      media = { type: 'emoji', label, images, requiresVisual: true, understandingScope: 'single-message-image' };
+    if (emojiBox) {
+      const images = [...emojiBox.querySelectorAll('img')].map(image => ({ src: image.currentSrc || image.getAttribute('src') || '', label: clean(image.getAttribute('alt') || image.getAttribute('aria-label') || image.getAttribute('title')) || null }));
+      const label = clean(emojiBox.getAttribute('aria-label') || emojiBox.getAttribute('title')) || images.map(image => image.label).filter(Boolean).join(' ') || null;
+      // 没有图片（懒加载没出来的表情）就不要挂 media，否则视觉采样无图可看会拖垮整轮；退化成 [表情] 文本。
+      if (images.length) media = { type: 'emoji', label, images, requiresVisual: true, understandingScope: 'single-message-image' };
     }
+    // 只有表情、没有文字的气泡也要给模型一个可读的占位，不然就是「已读不回」。
+    if (!text && (emojiBox || inlineEmoji)) text = '[表情]';
     if (share) {
       let url = null, videoId = null;
       for (const link of share.querySelectorAll('a[href]')) {
@@ -221,12 +253,18 @@ export function readConversationDom() {
 }
 
 export function readChatIdentityDom() {
-  const visible = e => { const r = e.getBoundingClientRect(), s = getComputedStyle(e); return r.width > 0 && r.height > 0 && r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight && s.visibility !== 'hidden' && s.display !== 'none'; };
-  const headers = [...document.querySelectorAll('[data-e2e="im-dialog"] .StackLayoutStackChatHeaderuser,[data-e2e="im-dialog"] [data-e2e="chat-header"]')].filter(visible);
-  const header = headers.length === 1 ? headers[0] : null;
+  // 2026-11-07：会话标题里的空格可能是 U+00A0（实测「海口男生发型定制设计 oimg」就带一个），
+  // 而会话列表那侧统一按 \s+ 归一成普通空格。两边不做同一套归一化，标题比对永远不相等。
+  const clean = value => String(value || '').replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u00A0\u2007\u202F]/g, ' ').replace(/\s+/g, ' ').trim();
+  const panel = document.querySelector('[data-e2e="im-dialog"]')?.getBoundingClientRect();
+  if (!panel || panel.width < 40 || panel.height < 40) return { displayName: undefined, avatar: '' };
+  const inPanel = e => { const r = e.getBoundingClientRect(), s = getComputedStyle(e); return r.width > 20 && r.height > 10 && r.left >= panel.left - 8 && r.right <= panel.right + 8 && r.top >= panel.top - 8 && r.bottom <= panel.bottom + 8 && s.visibility !== 'hidden' && s.display !== 'none'; };
+  // 2026-11-07：DOM 里常驻 7 个 ChatHeader 节点（关掉面板也不销毁），只认落在可见面板矩形内、标题非空的那个。
+  const headers = [...document.querySelectorAll('[data-e2e="im-dialog"] .StackLayoutStackChatHeaderuser,[data-e2e="im-dialog"] [data-e2e="chat-header"]')].filter(inPanel);
+  const header = headers.find(element => clean(element.querySelector('.StackLayoutStackChatHeadertitle,[data-e2e="chat-title"]')?.textContent)) || headers[0] || null;
   const src = header?.querySelector('img')?.getAttribute('src');
   let avatar = ''; try { avatar = new URL(src, location.href).pathname.replace(/~[^/]*/g, '').replace(/\/[0-9]+x[0-9]+\//g, '/'); } catch {}
-  return { displayName: header?.querySelector('.StackLayoutStackChatHeadertitle,[data-e2e="chat-title"]')?.textContent.trim(), avatar };
+  return { displayName: clean(header?.querySelector('.StackLayoutStackChatHeadertitle,[data-e2e="chat-title"]')?.textContent) || undefined, avatar };
 }
 
 // 会话列表去重：抖音同一批会话会被重复渲染成几十条同名行，且每行原生 id 都不一样。
@@ -273,6 +311,8 @@ export class ChatBrowser {
   }
   async dialog(page, signal) {
     stop(signal);
+    // 窗口最小化时面板会停在屏幕外（见 normalizeWindow 的注释），每次进面板前先纠正。
+    await this.normalizeWindow(page);
     // 2026-10-24 主人报「看完视频就再也播不动」的根因：这里原来挂了一个永久的 play 拦截器，
     // 私信面板关掉以后视频仍然一播就被 pause，自主观看下一次就判「作品被暂停」。
     // 现在只在没有自主观看时暂停一次，不挂永久监听；关面板时由 restorePage 收拾干净。
@@ -309,40 +349,251 @@ export class ChatBrowser {
       }, undefined, { timeout: 3000 }).catch(() => {});
     } catch { /* 关不上不影响已经读到的结果 */ }
   }
+  // 2026-11-06 主人报「读联系人一直 90 秒超时」。旧实现的三个问题：
+  // ① 用 Playwright 的 click 点 [data-e2e="user-info-follow"]，那个元素右边压着「N人正在直播」角标，
+  //    指针事件被角标吃掉，actionability 检查每次白等 5 秒，名单压根没打开；
+  // ② 每次点完还要等 8 秒 fans-container，三次重试约 40 秒，加上前后两次整页导航就顶穿宿主的 90 秒上限；
+  // ③ 读不到就 throw，this.following 永远停在 null，于是每次调用都重跑整段，越用越慢。
+  // 现在：在临时标签页里直达本人主页 → 按「关注」两个字的坐标用真实鼠标点（角标拦不到）→ 等行出现 →
+  // 把名单滚到底（名单是懒加载的，直接设 scrollTop 到底才触发下一批）→ 结果落盘缓存。
+  // 用临时标签页是因为读名单要整页导航，占用推荐流那页会把私信面板冲掉，回头还得重新等首页渲染再开面板。
   async verifyFollowing(page, signal) {
-    // 本人的关注名单仅在首次发现联系人时核对；后续新增联系人不会进入服务的固定白名单。
-    await page.goto(HOME, { waitUntil: 'domcontentloaded' });
-    const my = page.locator('a').filter({ has: page.locator('span').filter({ hasText: /^我的$/ }) });
-    await my.waitFor({ state: 'visible', timeout: 10_000 });
-    const href = await my.getAttribute('href');
-    const target = new URL(href, HOME);
-    if (target.hostname !== 'www.douyin.com' || !target.pathname.startsWith('/user/')) throw new Error('本人的关注入口不符合当前网页约定。');
-    await page.goto(target.href, { waitUntil: 'domcontentloaded' });
-    await page.locator('[data-e2e="user-info-follow"]').waitFor({ state: 'visible', timeout: 10_000 });
-    await page.waitForTimeout(800);
-    stop(signal);
-    // 2026-10-31：改版后点「关注」有时把名单开在**新标签页**，原来只在当前页找，永远找不到。
-    // 这里两条路都走：等 popup（新标签页），没有 popup 就读当前页；读不到再点一次，最多三次。
-    let rows = [];
-    for (let attempt = 0; attempt < 3 && !rows.length; attempt += 1) {
-      stop(signal);
-      const popupPromise = page.waitForEvent('popup', { timeout: 4000 }).catch(() => null);
-      await page.locator('[data-e2e="user-info-follow"]').click({ timeout: 5000 }).catch(() => {});
-      const popup = await popupPromise;
-      const view = popup || page;
-      if (popup) {
-        await popup.waitForLoadState('domcontentloaded').catch(() => {});
-        await popup.waitForTimeout(1200);
-      }
-      await view.locator('[data-e2e="user-fans-container"]').first().waitFor({ state: 'visible', timeout: 8000 }).catch(() => {});
-      rows = await view.evaluate(readFollowingRows).catch(() => []);
-      if (!rows.length) rows = await page.evaluate(readFollowingRows).catch(() => []);
-      if (popup) await popup.close().catch(() => {});
+    const traceAt = Date.now();
+    const trace = label => { if (process.env.DOUYIN_CHAT_TRACE) console.log(`[following] ${label} +${((Date.now() - traceAt) / 1000).toFixed(1)}s`); };
+    let tab;
+    try {
+      tab = await page.context().newPage();
+    } catch (error) {
+      trace('开临时标签页失败，退回当前页 ' + error.message);
+      tab = page;
     }
-    if (!rows.length) throw new Error('本人的关注列表未就绪，未确认联系人关系。');
-    this.following = rows;
-    await page.goto(HOME, { waitUntil: 'domcontentloaded' });
-    await this.dialog(page, signal);
+    const own = tab !== page;
+    try {
+      tab.setDefaultTimeout(10_000);
+      tab.setDefaultNavigationTimeout(25_000);
+      // 后台标签页的定时器会被浏览器降频（实测 300ms 变 1s 以上），读名单全靠短轮询，所以先提到前台。
+      if (own) await tab.bringToFront().catch(() => {});
+      let rows = [];
+      // 读名单不是主任务：整段自己算预算，最多 50 秒，超了就带空表回去（联系人照样能读）。
+      const deadline = Date.now() + 50_000;
+      const left = () => deadline - Date.now();
+      const hasEntry = () => tab.waitForFunction(() => Boolean(document.querySelector('[data-e2e="user-info-follow"]')), undefined, { timeout: Math.max(1_000, Math.min(12_000, left())) }).then(() => true).catch(() => false);
+      try {
+        await tab.goto(PROFILE, { waitUntil: 'domcontentloaded' });
+        trace('profile loaded');
+        // 本人主页偶发冷渲染很慢（实测 19 秒才出 DOM），等不到就重载一次再等，别把整段预算一次烧光。
+        let ready = await hasEntry();
+        if (!ready && left() > 6_000) { trace('entry not ready, reload'); await tab.reload({ waitUntil: 'domcontentloaded' }).catch(() => {}); ready = await hasEntry(); }
+        trace('follow entry visible ' + ready);
+        await tab.waitForTimeout(1_200);
+        for (let attempt = 0; attempt < 4 && !rows.length && left() > 4_000; attempt += 1) {
+          stop(signal);
+          // 弹层打开后要等约 2 秒才填数据；这期间再点一次，点中的是弹层遮罩，会把刚开的名单关掉。
+          // 所以只在「容器真的不在」时才点，点完先短等看容器是否出现（没出现=没点中，立刻重点）。
+          const opened = await tab.evaluate(() => Boolean(document.querySelector('[data-e2e="user-fans-container"]'))).catch(() => false);
+          if (!opened) {
+            const point = await tab.evaluate(() => {
+              const host = document.querySelector('[data-e2e="user-info-follow"]');
+              if (!host) return null;
+              const label = [...host.querySelectorAll('div,span')].find(element => (element.textContent || '').trim() === '关注') || host;
+              const rect = label.getBoundingClientRect();
+              return { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) };
+            }).catch(() => null);
+            if (!point) { await tab.waitForTimeout(600); continue; }
+            await tab.mouse.click(point.x, point.y);
+            trace('clicked attempt ' + attempt);
+          }
+          const started = Date.now();
+          while (Date.now() - started < 6_000 && left() > 1_500) {
+            rows = await tab.evaluate(readFollowingRows).catch(() => []);
+            if (rows.length) break;
+            const present = await tab.evaluate(() => Boolean(document.querySelector('[data-e2e="user-fans-container"]'))).catch(() => false);
+            if (!present && Date.now() - started > 2_500) { trace('容器没出现，重新点'); break; }
+            await tab.waitForTimeout(300);
+          }
+          trace('attempt ' + attempt + ' rows=' + rows.length);
+        }
+        if (rows.length) {
+          let stable = 0;
+          for (let round = 0; round < 26 && stable < 2 && left() > 2_000; round += 1) {
+            stop(signal);
+            const before = rows.length;
+            // 名单是懒加载 + 虚拟列表：滚到底 → 等一批渲染 → 再滚一次到底，每轮大约多拿 20~40 行。
+            const scroll = () => tab.evaluate(() => {
+              const root = document.querySelector('[data-e2e="user-fans-container"]');
+              if (!root) return { container: false };
+              const scroller = [root, ...root.querySelectorAll('div')].find(element => element.scrollHeight > element.clientHeight + 40 && /auto|scroll/.test(getComputedStyle(element).overflowY)) || root;
+              scroller.scrollTop = scroller.scrollHeight;
+              return { container: true, top: Math.round(scroller.scrollTop), height: scroller.scrollHeight };
+            }).catch(() => ({}));
+            const info = await scroll();
+            let next = rows;
+            for (let wait = 0; wait < 3 && next.length === before; wait += 1) {
+              await tab.waitForTimeout(350);
+              // 只增不减：弹层万一被关掉，重读会得到 0 行，不能把已经读到的名单冲掉。
+              const read = await tab.evaluate(readFollowingRows).catch(() => []);
+              if (read.length > next.length) next = read;
+            }
+            if (next.length > before) { await scroll(); await tab.waitForTimeout(350); const read = await tab.evaluate(readFollowingRows).catch(() => []); if (read.length > next.length) next = read; }
+            rows = next;
+            stable = rows.length === before ? stable + 1 : 0;
+            trace(`scroll ${round} rows=${rows.length} ${JSON.stringify(info)}`);
+          }
+        }
+      } catch (error) {
+        // 主页没渲染出来/没找到关注入口都只算「这次没核成」，不打断读联系人。
+        trace('名单读取中断 ' + error.message);
+      }
+      this.following = rows;
+      this.writeFollowingCache(rows.length > 0, rows);
+      trace('rows settled ' + rows.length);
+    } finally {
+      if (own) {
+        await tab.close().catch(() => {});
+        await page.bringToFront().catch(() => {});
+      }
+    }
+  }
+  // 关注名单读一次要 20~50 秒，而调用方几乎每轮都会传 verifyFollowing:true。
+  // 落一份缓存：成功管 6 小时，失败管 10 分钟（失败也存，否则每次调用都重烧一遍）。
+  followingCacheFile() {
+    try {
+      const dir = this.controller?.limits?.()?.stateDir;
+      return dir ? path.join(dir, 'chat-following.json') : null;
+    } catch { return null; }
+  }
+  readFollowingCache() {
+    const file = this.followingCacheFile();
+    if (!file) return null;
+    try {
+      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const at = Date.parse(data?.at);
+      if (!Number.isFinite(at) || (data?.ok !== true && data?.ok !== false)) return null;
+      if (data.ok && !Array.isArray(data.rows)) return null;
+      const ttl = data.ok ? 6 * 3_600_000 : 10 * 60_000;
+      return { ok: data.ok, rows: data.ok ? data.rows : [], stale: Date.now() - at > ttl };
+    } catch { return null; }
+  }
+  writeFollowingCache(ok, rows) {
+    const file = this.followingCacheFile();
+    if (!file) return;
+    const temporary = `${file}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(temporary, JSON.stringify({ at: new Date().toISOString(), ok, count: rows.length, rows }), 'utf8');
+      fs.renameSync(temporary, file);
+    } catch { /* 缓存写不进去不影响本次结果 */ }
+  }
+  // 2026-11-07：专用 Edge 窗口被最小化时，抖音消息面板会停在屏幕右外侧（实测 dialog.x=929 > 视口宽 921），
+  // 行有尺寸却点不动，select() 连点三次都判「会话没打开」，好友被暂停、续火花预检缺人。进面板前先恢复窗口。
+  async normalizeWindow(page) {
+    let session;
+    try {
+      session = await page.context().newCDPSession(page);
+      const { windowId, bounds } = await session.send('Browser.getWindowForTarget');
+      if (bounds.windowState !== 'normal') {
+        await session.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
+        await page.waitForTimeout(400);
+      }
+      if (bounds.width < 1_100 || bounds.height < 760) {
+        await session.send('Browser.setWindowBounds', { windowId, bounds: { width: 1_280, height: Math.min(960, Math.max(800, bounds.height)) } });
+        await page.waitForTimeout(600);
+      }
+      // 2026-11-07：窗口还可能被拖到屏幕外（实测 left:1055 top:880），此时视口里没有面板、
+      // 点「消息」也没反应，只能把窗口拉回可见区域再继续。
+      // 用 availLeft/availTop 判边界，双屏时窗口挂在副屏不会被误拉回主屏。
+      const area = await page.evaluate(() => ({ left: screen.availLeft, top: screen.availTop, width: screen.availWidth, height: screen.availHeight })).catch(() => null);
+      const visible = area
+        && bounds.left + 240 > area.left && bounds.left < area.left + area.width
+        && bounds.top + 120 > area.top && bounds.top < area.top + area.height;
+      if (area && !visible) {
+        await session.send('Browser.setWindowBounds', { windowId, bounds: { left: area.left + 40, top: area.top + 40 } });
+        await page.waitForTimeout(500);
+      }
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (session) await session.detach().catch(() => {});
+    }
+  }
+  // 面板和会话页是抖音的常驻 DOM：关掉以后节点还在、只是不可见，残留节点照样带宽高。
+  // 所以「可见」必须同时满足：面板整块在视口内 + 行的中心落在面板矩形内 + 会话标题落在面板矩形内。
+  async panelState(page) {
+    return page.evaluate(() => {
+      const dialog = document.querySelector('[data-e2e="im-dialog"]');
+      if (!dialog) return { open: false, rows: 0, chat: false };
+      const box = dialog.getBoundingClientRect();
+      const open = box.width >= 40 && box.height >= 40 && box.x >= 0 && box.y >= 0 && box.x + box.width <= innerWidth + 40 && box.y + box.height <= innerHeight + 40;
+      if (!open) return { open: false, rows: 0, chat: false };
+      const rows = [...dialog.querySelectorAll('[data-e2e="conversation-item"]')].filter(row => {
+        const rect = row.getBoundingClientRect();
+        const cx = rect.x + rect.width / 2, cy = rect.y + rect.height / 2;
+        return rect.width > 4 && rect.height > 4 && cx > box.x && cx < box.x + box.width && cy > box.y && cy < box.y + box.height && cx > 0 && cx < innerWidth;
+      }).length;
+      const chat = [...dialog.querySelectorAll('[class*="ChatHeader"]')].some(element => {
+        const rect = element.getBoundingClientRect();
+        return rect.width > 60 && rect.height > 10 && rect.x >= box.x - 8 && rect.x + rect.width <= box.x + box.width + 8;
+      });
+      return { open, rows, chat };
+    }).catch(() => ({ open: false, rows: 0, chat: false }));
+  }
+  // 会话页开着的时候，会话列表里会缺当前这一位（实测 12 人变 11 人）。读名单前必须先退回列表。
+  async leaveChat(page) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let state = await this.panelState(page);
+      if (!state.chat) return state;
+      // 会话页接了 Escape；不行再点标题栏左上角的返回箭头。
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForTimeout(450);
+      state = await this.panelState(page);
+      if (!state.chat) return state;
+      const back = await page.evaluate(() => {
+        const dialog = document.querySelector('[data-e2e="im-dialog"]');
+        if (!dialog) return null;
+        const header = [...dialog.querySelectorAll('[class*="ChatHeader"]')].find(element => { const rect = element.getBoundingClientRect(); return rect.width > 60 && rect.height > 10; });
+        if (!header) return null;
+        const rect = header.getBoundingClientRect();
+        return { x: Math.round(rect.x + 20), y: Math.round(rect.y + 22) };
+      }).catch(() => null);
+      if (back) await page.mouse.click(back.x, back.y).catch(() => {});
+      await page.waitForTimeout(600);
+    }
+    return this.panelState(page);
+  }
+  async ensureList(page, signal, attempts = 4) {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      stop(signal);
+      let state = await this.panelState(page);
+      if (state.open && state.rows >= 2) return state;
+      if (state.chat) { state = await this.leaveChat(page); if (state.open && state.rows >= 2) return state; }
+      if (!state.open) {
+        // 入口是 toggle：面板已经开着时再点会把它关掉，所以只在确认不可见时才点。
+        const entry = page.locator('[data-e2e="im-entry"]');
+        if (!await entry.count().catch(() => 0)) { await page.keyboard.press('Escape').catch(() => {}); await page.waitForTimeout(300); continue; }
+        await entry.click({ timeout: 5_000 }).catch(async () => {
+          const box = await entry.boundingBox().catch(() => null);
+          if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2).catch(() => {});
+        });
+      }
+      for (let wait = 0; wait < 12; wait += 1) {
+        await page.waitForTimeout(300);
+        state = await this.panelState(page);
+        if (state.open && state.rows >= 2) return state;
+        if (state.chat) break;
+      }
+    }
+    throw new Error('私信面板没有打开（消息入口点不开）。');
+  }
+  // 行要先进列表可视区再点：贴着面板底边那一行，点下去命中的是输入框。
+  async scrollRowIntoView(page, id) {
+    await page.evaluate(target => {
+      const list = document.querySelector('[data-e2e="im-dialog"] .conversationConversationListwrapper');
+      const row = [...document.querySelectorAll('[data-e2e="im-dialog"] [data-e2e="conversation-item"]')].find(item => item.getAttribute('data-deepseek-chat-id') === target);
+      if (!list || !row) return;
+      const listBox = list.getBoundingClientRect(), rowBox = row.getBoundingClientRect();
+      if (rowBox.top < listBox.top || rowBox.bottom > listBox.bottom) list.scrollTop += (rowBox.top - listBox.top) - Math.max(0, (listBox.height - rowBox.height) / 2);
+    }, id).catch(() => {});
+    await page.waitForTimeout(200);
   }
   // 2026-10-25 主人定：轮询先看右上角「消息」入口上的红数字，0 就不开面板。
   // 只读，不点开私信页；拿不准（入口没渲染/数字不是数字）就返回 count:null，让调用方照旧全读，宁慢勿漏。
@@ -365,10 +616,47 @@ export class ChatBrowser {
   closePanel() {
     return this.controller.withPage(async (page) => { await this.restorePage(page); return { ok: true }; }, {});
   }
+  // 列表是懒加载的：滚到底再回顶，逼出最后一批行，然后用「可见行数连续两次不变」确认渲染完。
+  // 2026-11-07：以前只在 first().waitFor(attached) 之后立刻读，面板刚打开时少一行（12 人读成 11 人），
+  // 于是 select() 判「指定联系人已变化」把好友暂停、续火花预检缺人拒绝启动。
+  async settleListRows(page) {
+    const count = () => page.evaluate(() => {
+      const dialog = document.querySelector('[data-e2e="im-dialog"]');
+      if (!dialog) return 0;
+      const box = dialog.getBoundingClientRect();
+      return [...dialog.querySelectorAll('[data-e2e="conversation-item"]')].filter(row => {
+        const rect = row.getBoundingClientRect();
+        const cx = rect.x + rect.width / 2, cy = rect.y + rect.height / 2;
+        return rect.width > 4 && rect.height > 4 && cx > box.x && cx < box.x + box.width && cy > box.y && cy < box.y + box.height;
+      }).length;
+    }).catch(() => 0);
+    const scroll = to => page.evaluate(position => {
+      const list = document.querySelector('[data-e2e="im-dialog"] .conversationConversationListwrapper');
+      if (!list) return false;
+      list.scrollTop = position === 'bottom' ? list.scrollHeight : 0;
+      return true;
+    }, to).catch(() => false);
+    if (await scroll('bottom')) await page.waitForTimeout(350);
+    if (await scroll('top')) await page.waitForTimeout(200);
+    let previous = -1, steady = 0;
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      await page.waitForTimeout(250);
+      const now = await count();
+      steady = now === previous ? steady + 1 : 0;
+      previous = now;
+      if (steady >= 2) return now;
+    }
+    return previous;
+  }
   async contactList(page, signal) {
     const flags = await this.dialog(page, signal);
     if (flags.blocked) return { ...flags, contacts: [] };
-    await page.locator('[data-e2e="im-dialog"] [data-e2e="conversation-item"]').first().waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+    // 会话页开着的时候，会话列表里会缺当前这一位（实测 12 人变 11 人），所以先退回列表；
+    // 面板也可能只是「残留 DOM 还在、其实关着」，ensureList 会把它真正打开。
+    await this.ensureList(page, signal);
+    await this.leaveChat(page);
+    await this.ensureList(page, signal);
+    await this.settleListRows(page);
     if (this.following?.length === 2) await page.waitForFunction(() => document.querySelectorAll('[data-e2e="im-dialog"] [data-e2e="conversation-item"]').length >= 2, undefined, { timeout: 5000 }).catch(() => {});
     const rawRows = await page.evaluate(readContactDom);
     // 2026-10-25：同一批会话被 DOM 重复渲染时会出现几十条同名行（设置页那次 17 个「测试用小猫」）。
@@ -405,19 +693,45 @@ export class ChatBrowser {
   listContacts({ signal, verifyFollowing = this.following === null, preferredIds = [] } = {}) {
     this.preferredContactIds = new Set(Array.isArray(preferredIds) ? preferredIds : []);
     return this.controller.withPage(async page => {
+      // 名单读一次要几十秒，而调用方几乎每轮都传 verifyFollowing:true：先看落盘缓存，新鲜的直接当已知关系用。
+      if (this.following === null) {
+        const cached = this.readFollowingCache();
+        if (cached && !cached.stale) this.following = cached.rows;
+      }
       const initial = await this.dialog(page, signal);
       if (initial.blocked) return { ...initial, contacts: [] };
-      if (verifyFollowing) await this.verifyFollowing(page, signal);
+      // 名单在临时标签页里读，推荐流那页不导航，刚打开的私信面板不会被打断。
+      if (verifyFollowing && this.following === null) await this.verifyFollowing(page, signal);
       return this.contactList(page, signal);
     }, { signal });
   }
   async select(page, recipientId, signal) {
     if (typeof recipientId !== 'string' || !/^conv:[a-f0-9]{64}$/.test(recipientId)) throw new TypeError('需要已发现的精确联系人 ID。');
-    const flags = await this.contactList(page, signal);
-    if (flags.blocked) return { flags };
-    const contact = this.contacts.get(recipientId);
+    let contact = this.contacts.get(recipientId);
+    let flags;
+    if (contact) {
+      // 轮询里 listContacts 刚整轮读过列表，这里再整轮重读要多花 5~6 秒；只在没这个人时才重读。
+      flags = await this.dialog(page, signal);
+      if (flags.blocked) return { flags };
+      await this.ensureList(page, signal);
+      await this.leaveChat(page);
+    } else {
+      flags = await this.contactList(page, signal);
+      if (flags.blocked) return { flags };
+      contact = this.contacts.get(recipientId);
+      // 列表少一行时这里会取不到人：先补读一次，而不是直接把好友判成「已变化」。
+      if (!contact) { await this.contactList(page, signal); contact = this.contacts.get(recipientId); }
+    }
     if (!contact || contact.isGroup === true) throw new Error('指定联系人已变化或属于群聊，已停止操作。');
-    const row = page.locator(`[data-e2e="conversation-item"][data-deepseek-chat-id="${recipientId}"]`);
+    let row = page.locator(`[data-e2e="conversation-item"][data-deepseek-chat-id="${recipientId}"]`);
+    // 2026-11-07：快路径只做 ensureList/leaveChat，列表一重渲染就把上次打的 data-deepseek-chat-id 全抹掉，
+    // count 变 0 直接抛「不是唯一匹配」（实测 步月登云 / jrz / 脑花 三个都被这条卡住）。缺标记就补读一次列表。
+    if (await row.count() !== 1) {
+      await this.contactList(page, signal);
+      contact = this.contacts.get(recipientId);
+      if (!contact || contact.isGroup === true) throw new Error('指定联系人已变化或属于群聊，已停止操作。');
+      row = page.locator(`[data-e2e="conversation-item"][data-deepseek-chat-id="${recipientId}"]`);
+    }
     if (await row.count() !== 1) throw new Error('指定会话不是唯一匹配，已停止操作。');
     const current = await page.evaluate(readChatIdentityDom);
     if (current.displayName !== contact.displayName) {
@@ -426,19 +740,34 @@ export class ChatBrowser {
         await back.click();
         await this.contactList(page, signal);
       }
-      // 2026-10-30：click 不带 timeout 时默认等 30 秒，会话行被推荐流视频挡住就是这样卡住的。
-      // 先 5 秒试一次，点不到就直接派发 DOM click（和 dialog() 打开消息面板同一种兜底）。
-      try { await row.click({ timeout: 5000 }); }
-      catch { await row.evaluate(element => element.click()).catch(() => {}); }
-      await page.waitForFunction(expected => {
-        const visible = e => { const r = e.getBoundingClientRect(), s = getComputedStyle(e); return r.width > 0 && r.height > 0 && r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight && s.visibility !== 'hidden' && s.display !== 'none'; };
-        const headers = [...document.querySelectorAll('[data-e2e="im-dialog"] .StackLayoutStackChatHeaderuser,[data-e2e="im-dialog"] [data-e2e="chat-header"]')].filter(visible);
-        if (headers.length !== 1) return false;
-        const header = headers[0];
-        const name = header.querySelector('.StackLayoutStackChatHeadertitle,[data-e2e="chat-title"]')?.textContent.trim();
-        let avatar = ''; try { avatar = new URL(header.querySelector('img')?.getAttribute('src'), location.href).pathname.replace(/~[^/]*/g, '').replace(/\/[0-9]+x[0-9]+\//g, '/'); } catch {}
-        return name === expected.displayName;
-      }, { displayName: contact.displayName }, { timeout: 10_000 });
+      // 2026-11-07：DOM 里常驻 7 个 ChatHeader，不能用「可见 header 数量」判会话开没开；
+      // 必须要求「面板在视口内 + header 在面板矩形内 + 标题等于期望昵称」。
+      const opened = () => page.waitForFunction(expected => {
+        const dialog = document.querySelector('[data-e2e="im-dialog"]');
+        if (!dialog) return false;
+        const box = dialog.getBoundingClientRect();
+        if (!(box.width >= 40 && box.height >= 40 && box.x >= 0 && box.y >= 0 && box.x + box.width <= innerWidth + 40 && box.y + box.height <= innerHeight + 40)) return false;
+        const clean = value => String(value || '').replace(/[\u00A0\u2007\u202F]/g, ' ').replace(/\s+/g, ' ').trim();
+        const headers = [...dialog.querySelectorAll('.StackLayoutStackChatHeaderuser,[data-e2e="chat-header"]')].filter(header => {
+          const rect = header.getBoundingClientRect();
+          return rect.width > 20 && rect.height > 10 && rect.left >= box.left - 8 && rect.right <= box.right + 8 && rect.top >= box.top - 8 && rect.bottom <= box.bottom + 8;
+        });
+        return headers.some(header => clean(header.querySelector('.StackLayoutStackChatHeadertitle,[data-e2e="chat-title"]')?.textContent) === clean(expected));
+      }, contact.displayName, { timeout: 8_000 }).then(() => true).catch(() => false);
+      // 三次尝试：先 Playwright click（带 5 秒上限），再按坐标鼠标点（行先滚进列表可视区），最后派发 DOM click。
+      let done = false;
+      for (let attempt = 0; attempt < 3 && !done; attempt += 1) {
+        stop(signal);
+        await this.scrollRowIntoView(page, recipientId);
+        if (attempt === 0) await row.click({ timeout: 5_000 }).catch(() => {});
+        else if (attempt === 1) {
+          const box = await row.boundingBox().catch(() => null);
+          if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2).catch(() => {});
+        } else await row.evaluate(element => element.click()).catch(() => {});
+        await page.waitForTimeout(250);
+        done = await opened();
+      }
+      if (!done) throw new Error('会话没有打开（点击没有生效），已停止操作。');
       await page.waitForTimeout(300);
     }
     const identity = await page.evaluate(readChatIdentityDom);
@@ -470,6 +799,9 @@ export class ChatBrowser {
         this.mediaResources.set(ref, { src: image.src, label: image.label ?? null, recipientId });
         return { resourceRef: ref, label: image.label ?? null };
       });
+      // 2026-11-07：表情图片的地址有时还没加载（src 为空），这种 media 拿去视觉采样必然「没有画面」，
+      // 会把联系人直接判成暂停。没图就退化成 [表情] 文本，交给模型正常回一句。
+      if (media.type === 'emoji' && resources.length === 0) return { ...row, media: null };
       return { ...row, media: { ...media, imageCount: resources.length, resources } };
     });
     const identified = this.identities.identify(recipientId, rows);
@@ -597,7 +929,7 @@ export class ChatBrowser {
       } finally { await this.restorePage(page); }
     }, { signal });
   }
-  sendMessage(recipientId, message, { allowed = false, expectedMessageIds, expectedMessageContent, signal: parentSignal, authorize, followUp = false } = {}) {
+  sendMessage(recipientId, message, { allowed = false, expectedMessageIds, expectedMessageContent, signal: parentSignal, authorize, followUp = false, knownDraft = '' } = {}) {
     if (allowed !== true) return Promise.reject(new Error('发送需要这个指定联系人的明确授权。'));
     if (typeof message !== 'string' || !message.trim() || [...message].length > 1000) return Promise.reject(new TypeError('发送内容须为 1 到 1000 字的非空文字。'));
     if (authorize !== undefined && (typeof authorize !== 'function' || typeof authorize.beginDispatch !== 'function')) return Promise.reject(new TypeError('主动问候需要本机许可检查和最终短输入控制。'));
@@ -627,9 +959,11 @@ export class ChatBrowser {
       if (await editor.count() !== 1) throw new Error('没有唯一的私信文字输入框。');
       if (await editor.locator('img,video,audio,[data-slate-void="true"]').count()) throw new Error('当前会话已有图片或语音草稿，已停止发送以保留原内容。');
       const staleDraft = readableDraft(await editor.innerText());
-      // 中止过一次的上一次回复会以草稿留在输入框里（截图里那条 [草稿] [自动回复]…）。
+      // 中止过一次的上一次回复会以草稿留在输入框里。
+      // 2026-11-07：以前靠文本开头是不是「[自动回复]」来认自己的草稿；主人要求正文不带任何标记后，
+      // 改成让调用方把自己上一次填进去的原文传进来比对，只有对得上才敢覆盖，别人的草稿照样保留。
       // 直接改 textContent 清不掉 Slate 的内部状态，fill 会变成"再追加一份"，所以用真键盘全选删除再复核。
-      if (staleDraft && !staleDraft.startsWith('[自动回复]')) throw new Error('当前会话已有别人的草稿，已停止发送以保留原内容。');
+      if (staleDraft && readableDraft(knownDraft || '') !== staleDraft) throw new Error('当前会话已有别人的草稿，已停止发送以保留原内容。');
       if (staleDraft) {
         await editor.click({ timeout: 3000 }).catch(() => {});
         await page.keyboard.press('Control+A').catch(() => {});

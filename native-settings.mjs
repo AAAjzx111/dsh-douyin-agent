@@ -69,9 +69,9 @@ export function createNativeSettingsRoute({ getController, getComments, getRepli
           value = await startWatch(input); break;
         }
         case '/watch/stop': {
+          // 2026-11-07 主人定：停止自主观看只停观看，不再顺带停掉私信自动回复。
+          // 要停私信请用「停止私信回复」（/chat/stop），两件事分开控制。
           empty(input); value = await (await getWatch()).stop({ explicit: true });
-          // 停轮次时顺带停掉随轮次起来的私信自动回复（2026-10-24）。
-          try { const chat = await getChat(); if (chat.state().running) chat.stop(); } catch { /* 没起过就算了 */ }
           break;
         }
         case '/spark/configure': value = await (await getSpark()).configure(input, { explicit: true }); break;
